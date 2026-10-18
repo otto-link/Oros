@@ -24,6 +24,17 @@ option(OROS_BUILD_UI_TESTS "Build Oros UI manual test" ON)
 
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets)
 
+find_package(spdlog QUIET)
+if(NOT spdlog_FOUND)
+  include(FetchContent)
+  FetchContent_Declare(
+    spdlog
+    GIT_REPOSITORY https://github.com/gabime/spdlog.git
+    GIT_TAG v1.14.1
+    GIT_SHALLOW TRUE)
+  FetchContent_MakeAvailable(spdlog)
+endif()
+
 include(FetchContent)
 
 # --- Core library

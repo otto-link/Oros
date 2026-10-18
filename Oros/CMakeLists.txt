@@ -6,8 +6,11 @@ set(CMAKE_AUTORCC ON)
 
 # --- Library definition
 
-add_library(Oros include/oros/oros.hpp include/oros/ui/viewport_widget.hpp
-                 src/oros.cpp src/ui/viewport_widget.cpp)
+add_library(
+  Oros
+  include/oros/logger.hpp include/oros/oros.hpp
+  include/oros/ui/viewport_widget.hpp src/logger.cpp src/oros.cpp
+  src/ui/viewport_widget.cpp)
 
 add_library(Oros::Oros ALIAS Oros)
 
@@ -21,7 +24,8 @@ target_include_directories(
 
 # --- Dependencies
 
-target_link_libraries(Oros PUBLIC Qt6::Core Qt6::Gui Qt6::Widgets)
+target_link_libraries(Oros PUBLIC spdlog::spdlog Qt6::Core Qt6::Gui
+                                  Qt6::Widgets)
 
 # --- Compiler warnings and features
 
