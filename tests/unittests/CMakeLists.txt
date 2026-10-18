@@ -4,7 +4,8 @@ set(CMAKE_AUTOMOC ON)
 
 # --- Unit test executable
 
-add_executable(oros_unittests logger_test.cpp ui/viewport_widget_test.cpp)
+add_executable(oros_unittests logger_test.cpp terrain_test.cpp
+                              ui/viewport_widget_test.cpp)
 
 target_link_libraries(oros_unittests PRIVATE Oros::Oros GTest::gtest_main
                                              Qt6::Widgets)

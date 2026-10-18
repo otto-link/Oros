@@ -8,8 +8,21 @@ set(CMAKE_AUTORCC ON)
 
 add_library(
   Oros
-  include/oros/logger.hpp include/oros/oros.hpp
-  include/oros/ui/viewport_widget.hpp src/logger.cpp src/oros.cpp
+  include/oros/logger.hpp
+  include/oros/oros.hpp
+  include/oros/terrain/async_lod_selector.hpp
+  include/oros/terrain/cdlod_quadtree.hpp
+  include/oros/terrain/grid_mesh_factory.hpp
+  include/oros/terrain/heightmap_data.hpp
+  include/oros/terrain/heightmap_patch.hpp
+  include/oros/ui/viewport_widget.hpp
+  src/logger.cpp
+  src/oros.cpp
+  src/terrain/async_lod_selector.cpp
+  src/terrain/cdlod_quadtree.cpp
+  src/terrain/grid_mesh_factory.cpp
+  src/terrain/heightmap_data.cpp
+  src/terrain/heightmap_patch.cpp
   src/ui/viewport_widget.cpp)
 
 add_library(Oros::Oros ALIAS Oros)
