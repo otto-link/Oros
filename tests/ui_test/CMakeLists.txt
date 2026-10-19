@@ -23,3 +23,13 @@ target_link_libraries(oros_ui_test PRIVATE Oros::Oros Qt6::Widgets
                                            fastnoiselite)
 
 target_compile_features(oros_ui_test PRIVATE cxx_std_20)
+
+# --- CDLOD visual test executable
+
+add_executable(ui_cdlod_test cdlod_main.cpp cdlod_view_widget.cpp
+                             cdlod_view_widget.hpp)
+
+target_link_libraries(ui_cdlod_test PRIVATE Oros::Oros Qt6::Widgets
+                                            fastnoiselite)
+
+target_compile_features(ui_cdlod_test PRIVATE cxx_std_20)
