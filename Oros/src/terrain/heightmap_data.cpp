@@ -112,6 +112,55 @@ std::pair<float, float> HeightmapData::get_elevation_range_in_rect(
   const size_t y1 = static_cast<size_t>(
       std::ceil(max_v * static_cast<float>(height_ - 1)));
 
+  // If bounding pyramid is available, query appropriate level for O(1) bounds
+  if (!min_max_pyramid_.empty())
+  {
+    const size_t span_x = (x1 >= x0) ? (x1 - x0 + 1) : 1;
+    const size_t span_y = (y1 >= y0) ? (y1 - y0 + 1) : 1;
+    const size_t max_span = std::max(span_x, span_y);
+
+    // Find pyramid level where cell size is >= max_span / 4 (ensuring at most a
+    // small grid of cells)
+    size_t target_level = 0;
+    size_t cell_size = 2; // Level 0 aggregates 2x2 original texels
+
+    while (target_level + 1 < min_max_pyramid_.size() &&
+           (cell_size * 4) < max_span)
+    {
+      target_level++;
+      cell_size *= 2;
+    }
+
+    const size_t cur_w = pyramid_widths_[target_level];
+    const size_t cur_h = pyramid_heights_[target_level];
+    const auto  &level = min_max_pyramid_[target_level];
+
+    const size_t px0 = std::min(x0 / cell_size, cur_w - 1);
+    const size_t px1 = std::min(x1 / cell_size, cur_w - 1);
+    const size_t py0 = std::min(y0 / cell_size, cur_h - 1);
+    const size_t py1 = std::min(y1 / cell_size, cur_h - 1);
+
+    float min_val = std::numeric_limits<float>::infinity();
+    float max_val = -std::numeric_limits<float>::infinity();
+
+    for (size_t py = py0; py <= py1; ++py)
+    {
+      const size_t row_start = py * cur_w;
+      for (size_t px = px0; px <= px1; ++px)
+      {
+        const auto &node = level[row_start + px];
+        min_val = std::min(min_val, node.min_z);
+        max_val = std::max(max_val, node.max_z);
+      }
+    }
+
+    if (min_val <= max_val)
+    {
+      return {min_val, max_val};
+    }
+  }
+
+  // Fallback linear scan if pyramid is not built
   float min_val = std::numeric_limits<float>::infinity();
   float max_val = -std::numeric_limits<float>::infinity();
 

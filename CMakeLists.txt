@@ -22,7 +22,7 @@ option(OROS_BUILD_UI_TESTS "Build Oros UI manual test" ON)
 
 # --- Dependencies
 
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets OpenGL OpenGLWidgets)
 
 find_package(spdlog QUIET)
 if(NOT spdlog_FOUND)

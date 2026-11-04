@@ -62,21 +62,55 @@ void CDLODQuadTree::select_node(const HeightmapPatch        &patch,
                                 const CDLODNode             &node,
                                 std::vector<CDLODInstance> &out_instances) const
 {
-  // Calculate center of node in local patch space
-  const float center_u = node.u0 + node.size_u * 0.5f;
-  const float center_v = node.v0 + node.size_v * 0.5f;
-  const float mid_z = (node.min_z + node.max_z) * 0.5f;
+  // Compute node world-space Axis-Aligned Bounding Box (AABB)
+  const Vec3 c_min = patch.local_to_world(node.u0, node.v0, node.min_z);
+  const Vec3 c_max = patch.local_to_world(node.u0 + node.size_u,
+                                          node.v0 + node.size_v,
+                                          node.max_z);
 
-  // Transform center of node to world space
-  const Vec3 node_world_center = patch.local_to_world(center_u,
-                                                      center_v,
-                                                      mid_z);
+  const float aabb_min_x = std::min(c_min.x, c_max.x);
+  const float aabb_max_x = std::max(c_min.x, c_max.x);
+  const float aabb_min_y = std::min(c_min.y, c_max.y);
+  const float aabb_max_y = std::max(c_min.y, c_max.y);
+  const float aabb_min_z = std::min(c_min.z, c_max.z);
+  const float aabb_max_z = std::max(c_min.z, c_max.z);
 
-  // Distance from camera to node center
-  const float dx = context.camera_pos.x - node_world_center.x;
-  const float dy = context.camera_pos.y - node_world_center.y;
-  const float dz = context.camera_pos.z - node_world_center.z;
-  const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+  // Minimum distance from camera to the node's AABB
+  float aabb_dist_sq = 0.0f;
+  if (context.camera_pos.x < aabb_min_x)
+  {
+    const float d = context.camera_pos.x - aabb_min_x;
+    aabb_dist_sq += d * d;
+  }
+  else if (context.camera_pos.x > aabb_max_x)
+  {
+    const float d = context.camera_pos.x - aabb_max_x;
+    aabb_dist_sq += d * d;
+  }
+
+  if (context.camera_pos.y < aabb_min_y)
+  {
+    const float d = context.camera_pos.y - aabb_min_y;
+    aabb_dist_sq += d * d;
+  }
+  else if (context.camera_pos.y > aabb_max_y)
+  {
+    const float d = context.camera_pos.y - aabb_max_y;
+    aabb_dist_sq += d * d;
+  }
+
+  if (context.camera_pos.z < aabb_min_z)
+  {
+    const float d = context.camera_pos.z - aabb_min_z;
+    aabb_dist_sq += d * d;
+  }
+  else if (context.camera_pos.z > aabb_max_z)
+  {
+    const float d = context.camera_pos.z - aabb_max_z;
+    aabb_dist_sq += d * d;
+  }
+
+  const float distance = std::sqrt(aabb_dist_sq);
 
   // Determine LOD visibility threshold
   const size_t lod_idx = std::min<size_t>(node.lod_level,
