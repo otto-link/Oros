@@ -1,0 +1,108 @@
+material {
+    name : cdlod_terrain_lit,
+    shadingModel : lit,
+    culling : none,
+    doubleSided : true,
+    vertexDomain : world,
+    parameters : [
+        {
+            type : sampler2d,
+            name : heightmap
+        },
+        {
+            type : sampler2d,
+            name : normalMap
+        },
+        {
+            type : float3,
+            name : cameraPos
+        },
+        {
+            type : float4,
+            name : patchOffsetScale
+        },
+        {
+            type : float4,
+            name : patchMorphLod
+        },
+        {
+            type : float,
+            name : heightScale
+        },
+        {
+            type : float2,
+            name : worldScale
+        },
+        {
+            type : float,
+            name : gridDim
+        },
+        {
+            type : bool,
+            name : morphEnabled
+        }
+    ],
+    variables : [
+        vLodColor,
+        vUv
+    ],
+    requires : [
+        position
+    ]
+}
+
+vertex {
+    vec3 getLodColor(int lod) {
+        if (lod == 0) return vec3(0.314, 0.980, 0.482); // Dracula Green  (#50fa7b)
+        if (lod == 1) return vec3(0.545, 0.914, 0.992); // Dracula Cyan   (#8be9fd)
+        if (lod == 2) return vec3(0.945, 0.980, 0.549); // Dracula Yellow (#f1fa8c)
+        if (lod == 3) return vec3(1.000, 0.722, 0.424); // Dracula Orange (#ffb86c)
+        if (lod == 4) return vec3(1.000, 0.475, 0.776); // Dracula Pink   (#ff79c6)
+        if (lod == 5) return vec3(0.741, 0.576, 0.976); // Dracula Purple (#bd93f9)
+        if (lod == 6) return vec3(1.000, 0.333, 0.333); // Dracula Red    (#ff5555)
+        return vec3(0.384, 0.447, 0.643);                // Dracula Comment(#6272a4)
+    }
+
+    void materialVertex(inout MaterialVertexInputs material) {
+        vec2 localPos = getPosition().xy;
+        vec2 patchOffset = materialParams.patchOffsetScale.xy;
+        vec2 patchScale  = materialParams.patchOffsetScale.zw;
+        float morphStart = materialParams.patchMorphLod.x;
+        float morphRange = materialParams.patchMorphLod.y;
+        float lodLevel   = materialParams.patchMorphLod.z;
+
+        vec2 uv = patchOffset + localPos * patchScale;
+        vec2 worldXy = (uv - vec2(0.5)) * materialParams.worldScale;
+
+        float hSample = texture(materialParams_heightmap, uv).r * materialParams.heightScale;
+        float dist = length(vec3(worldXy.x, worldXy.y, hSample) - materialParams.cameraPos);
+
+        float morphAlpha = 0.0;
+        if (materialParams.morphEnabled && morphRange > 0.001) {
+            morphAlpha = clamp((dist - morphStart) / morphRange, 0.0, 1.0);
+        }
+
+        float meshQuads = materialParams.gridDim - 1.0;
+        vec2 fracUv = fract(localPos * (meshQuads * 0.5)) / (meshQuads * 0.5);
+        vec2 uvCoarse = uv - fracUv * patchScale;
+
+        vec2 uvMorphed = mix(uv, uvCoarse, morphAlpha);
+        vec2 worldXyMorphed = (uvMorphed - vec2(0.5)) * materialParams.worldScale;
+        float height = texture(materialParams_heightmap, uvMorphed).r * materialParams.heightScale;
+
+        material.worldPosition = vec4(worldXyMorphed.x, worldXyMorphed.y, height, 1.0) - vec4(getWorldOffset(), 0.0);
+        material.vLodColor = vec4(getLodColor(int(round(lodLevel))), 1.0);
+        material.vUv = vec4(uvMorphed, 0.0, 0.0);
+    }
+}
+
+fragment {
+    void material(inout MaterialInputs material) {
+        vec3 nTex = texture(materialParams_normalMap, variable_vUv.xy).xyz * 2.0 - 1.0;
+        material.normal = normalize(nTex);
+        prepareMaterial(material);
+        material.baseColor = variable_vLodColor;
+        material.roughness = 0.6;
+        material.metallic = 0.0;
+    }
+}

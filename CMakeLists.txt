@@ -35,6 +35,8 @@ if(NOT spdlog_FOUND)
   FetchContent_MakeAvailable(spdlog)
 endif()
 
+include(cmake/Filament.cmake)
+
 include(FetchContent)
 
 # --- Core library
