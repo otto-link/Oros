@@ -50,15 +50,15 @@ GridMesh GridMeshFactory::create_unit_grid(size_t resolution)
       const uint32_t i2 = static_cast<uint32_t>((y + 1) * resolution + x);
       const uint32_t i3 = static_cast<uint32_t>((y + 1) * resolution + (x + 1));
 
-      // Triangle 1
+      // Triangle 1 (CCW winding in XY plane for +Z upward normal)
       mesh.indices.push_back(i0);
-      mesh.indices.push_back(i2);
       mesh.indices.push_back(i1);
+      mesh.indices.push_back(i2);
 
-      // Triangle 2
+      // Triangle 2 (CCW winding in XY plane for +Z upward normal)
       mesh.indices.push_back(i1);
-      mesh.indices.push_back(i2);
       mesh.indices.push_back(i3);
+      mesh.indices.push_back(i2);
     }
   }
 

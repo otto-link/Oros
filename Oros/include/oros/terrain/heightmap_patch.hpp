@@ -71,6 +71,19 @@ public:
   // Computes conservative world-space Axis-Aligned Bounding Box (AABB)
   [[nodiscard]] AABB compute_world_aabb() const;
 
+  // Computes conservative world-space AABB for a normalized sub-region [u0, v0]
+  // to [u1, v1] with elevation bounds [min_z, max_z]
+  [[nodiscard]] AABB compute_subregion_world_aabb(float u0,
+                                                  float v0,
+                                                  float u1,
+                                                  float v1,
+                                                  float min_z,
+                                                  float max_z) const;
+
+  // Interpolates normalized elevation at (u, v) in [0, 1] using bilinear
+  // filtering
+  [[nodiscard]] float sample_elevation(float u, float v) const;
+
 private:
   std::string                    id_{};
   std::shared_ptr<HeightmapData> heightmap_data_{nullptr};

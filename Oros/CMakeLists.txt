@@ -10,6 +10,7 @@ add_library(
   Oros
   include/oros/logger.hpp
   include/oros/oros.hpp
+  include/oros/scene/scene_types.hpp
   include/oros/terrain/async_lod_selector.hpp
   include/oros/terrain/cdlod_quadtree.hpp
   include/oros/terrain/grid_mesh_factory.hpp
@@ -18,6 +19,7 @@ add_library(
   include/oros/ui/viewport_widget.hpp
   src/logger.cpp
   src/oros.cpp
+  src/scene/scene_types.cpp
   src/terrain/async_lod_selector.cpp
   src/terrain/cdlod_quadtree.cpp
   src/terrain/grid_mesh_factory.cpp
@@ -26,6 +28,13 @@ add_library(
   src/ui/viewport_widget.cpp)
 
 add_library(Oros::Oros ALIAS Oros)
+
+filament_compile_materials(
+  Oros
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/render/materials/cdlod_terrain_unlit.mat
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/render/materials/cdlod_terrain_lit.mat
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/render/materials/instanced_object_lit.mat
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/render/materials/sky_atmosphere.mat)
 
 # --- Include directories
 
@@ -37,8 +46,10 @@ target_include_directories(
 
 # --- Dependencies
 
-target_link_libraries(Oros PUBLIC spdlog::spdlog Qt6::Core Qt6::Gui
-                                  Qt6::Widgets)
+target_link_libraries(
+  Oros
+  PUBLIC spdlog::spdlog Qt6::Core Qt6::Gui Qt6::Widgets
+  PRIVATE filament::filament)
 
 # --- Compiler warnings and features
 

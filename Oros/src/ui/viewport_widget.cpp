@@ -2,33 +2,864 @@
    Public License. The full license is in the file LICENSE, distributed with
    this software. */
 
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <map>
+#include <vector>
+
+#include "oros/logger.hpp"
+#include "oros/terrain/cdlod_quadtree.hpp"
+#include "oros/terrain/grid_mesh_factory.hpp"
+#include "oros/ui/viewport_widget.hpp"
+
+#include <QGuiApplication>
 #include <QMouseEvent>
-#include <QPainter>
+#include <QResizeEvent>
+#include <QShowEvent>
 #include <QWheelEvent>
-#include <oros/ui/viewport_widget.hpp>
+#include <QtMath>
+#include <filament/Box.h>
+#include <filament/Camera.h>
+#include <filament/Color.h>
+#include <filament/Engine.h>
+#include <filament/IndexBuffer.h>
+#include <filament/IndirectLight.h>
+#include <filament/LightManager.h>
+#include <filament/Material.h>
+#include <filament/MaterialInstance.h>
+#include <filament/Options.h>
+#include <filament/RenderableManager.h>
+#include <filament/Renderer.h>
+#include <filament/Scene.h>
+#include <filament/Skybox.h>
+#include <filament/SwapChain.h>
+#include <filament/Texture.h>
+#include <filament/TextureSampler.h>
+#include <filament/TransformManager.h>
+#include <filament/VertexBuffer.h>
+#include <filament/View.h>
+#include <filament/Viewport.h>
+#include <math/mat3.h>
+#include <math/mat4.h>
+#include <math/quat.h>
+#include <math/vec2.h>
+#include <math/vec3.h>
+#include <math/vec4.h>
+#include <numbers>
+#include <utils/Entity.h>
+#include <utils/EntityManager.h>
+
+namespace
+{
+
+static const uint8_t MATERIAL_TERRAIN_UNLIT_PKG[] = {
+#include "materials/cdlod_terrain_unlit.h"
+};
+
+static const uint8_t MATERIAL_TERRAIN_LIT_PKG[] = {
+#include "materials/cdlod_terrain_lit.h"
+};
+
+static const uint8_t MATERIAL_INSTANCED_OBJECT_PKG[] = {
+#include "materials/instanced_object_lit.h"
+};
+
+static const uint8_t MATERIAL_SKY_ATMOSPHERE_PKG[] = {
+#include "materials/sky_atmosphere.h"
+};
+
+constexpr size_t MAX_INSTANCES_PER_BATCH = 16384;
+constexpr int    INSTANCE_TEX_WIDTH = 128; // 128 instances per row (256 texels)
+
+filament::math::quatf pack_normal_to_tangent_frame(
+    const oros::terrain::Vec3 &normal)
+{
+  filament::math::float3 n(normal.x, normal.y, normal.z);
+  const float            n_len = length(n);
+  if (n_len > 1e-6f)
+  {
+    n /= n_len;
+  }
+  else
+  {
+    n = {0.0f, 0.0f, 1.0f};
+  }
+
+  const filament::math::float3 up = (std::abs(n.z) < 0.99f)
+                                        ? filament::math::float3(0.0f,
+                                                                 0.0f,
+                                                                 1.0f)
+                                        : filament::math::float3(1.0f,
+                                                                 0.0f,
+                                                                 0.0f);
+  const filament::math::float3 t = normalize(cross(up, n));
+  const filament::math::float3 b = cross(n, t);
+
+  filament::math::mat3f tbn;
+  tbn[0] = t;
+  tbn[1] = b;
+  tbn[2] = n;
+
+  return filament::math::mat3f::packTangentFrame(tbn);
+}
+
+} // namespace
 
 namespace oros::ui
 {
 
-// --- Construction
+// --- Internal Filament structures
 
-ViewportWidget::ViewportWidget(QWidget *parent) : QWidget(parent)
+struct PatchRenderNode
 {
+  utils::Entity               entity{};
+  filament::MaterialInstance *unlit_instance{nullptr};
+  filament::MaterialInstance *lit_instance{nullptr};
+  bool                        in_scene{false};
+};
+
+struct TerrainGpuEntry
+{
+  scene::TerrainLayerDescriptor            descriptor{};
+  std::unique_ptr<terrain::HeightmapPatch> patch{nullptr};
+  std::vector<terrain::CDLODInstance>      lod_instances{};
+  filament::Texture                       *heightmap_tex{nullptr};
+  filament::Texture                       *normal_tex{nullptr};
+  filament::Texture                       *albedo_tex{nullptr};
+  bool                                     textures_dirty{true};
+};
+
+struct InstancedBatchGpu
+{
+  utils::Entity               entity{};
+  filament::MaterialInstance *mat_instance{nullptr};
+  filament::Texture          *instance_data_tex{nullptr};
+  bool                        in_scene{false};
+};
+
+struct InstancedGroupGpuEntry
+{
+  scene::InstancedObjectGroup    group{};
+  filament::VertexBuffer        *vb{nullptr};
+  filament::IndexBuffer         *ib{nullptr};
+  uint32_t                       index_count{0};
+  std::vector<InstancedBatchGpu> batches{};
+  bool                           gpu_dirty{true};
+};
+
+struct ViewportWidget::Impl
+{
+  filament::Engine        *engine{nullptr};
+  filament::Renderer      *renderer{nullptr};
+  filament::Scene         *scene{nullptr};
+  filament::View          *view{nullptr};
+  filament::Camera        *camera{nullptr};
+  filament::SwapChain     *swap_chain{nullptr};
+  filament::Skybox        *skybox{nullptr};
+  filament::IndirectLight *indirect_light{nullptr};
+
+  utils::Entity camera_entity{};
+  utils::Entity sun_light_entity{};
+
+  // Sky dome for atmospheric scattering
+  utils::Entity               sky_dome_entity{};
+  filament::VertexBuffer     *sky_dome_vb{nullptr};
+  filament::IndexBuffer      *sky_dome_ib{nullptr};
+  uint32_t                    sky_dome_index_count{0};
+  filament::Material         *sky_material{nullptr};
+  filament::MaterialInstance *sky_mat_instance{nullptr};
+  bool                        sky_dome_in_scene{false};
+
+  // Materials
+  filament::Material *terrain_unlit_mat{nullptr};
+  filament::Material *terrain_lit_mat{nullptr};
+  filament::Material *instanced_obj_mat{nullptr};
+
+  // Shared static grid mesh for CDLOD
+  filament::VertexBuffer *shared_grid_vb{nullptr};
+  filament::IndexBuffer  *shared_solid_ib{nullptr};
+  filament::IndexBuffer  *shared_wire_ib{nullptr};
+  uint32_t                solid_index_count{0};
+  uint32_t                wire_index_count{0};
+
+  // Fallback 1x1 white texture
+  filament::Texture *fallback_white_tex{nullptr};
+
+  // Multi-terrain state
+  terrain::CDLODQuadTree                 quadtree{7};
+  std::map<std::string, TerrainGpuEntry> terrains{};
+  std::vector<PatchRenderNode>           terrain_node_pool{};
+  size_t                                 active_cdlod_nodes{0};
+
+  // Instanced objects state
+  std::map<std::string, InstancedGroupGpuEntry> instanced_groups{};
+
+  void destroy_terrain_textures(TerrainGpuEntry &entry)
+  {
+    if (!engine)
+    {
+      return;
+    }
+
+    if (entry.heightmap_tex)
+    {
+      engine->destroy(entry.heightmap_tex);
+      entry.heightmap_tex = nullptr;
+    }
+
+    if (entry.normal_tex)
+    {
+      engine->destroy(entry.normal_tex);
+      entry.normal_tex = nullptr;
+    }
+
+    if (entry.albedo_tex)
+    {
+      engine->destroy(entry.albedo_tex);
+      entry.albedo_tex = nullptr;
+    }
+  }
+
+  void destroy_instanced_group_gpu(InstancedGroupGpuEntry &entry)
+  {
+    if (!engine)
+    {
+      return;
+    }
+
+    for (auto &batch : entry.batches)
+    {
+      if (batch.in_scene && batch.entity)
+      {
+        scene->remove(batch.entity);
+        batch.in_scene = false;
+      }
+
+      if (batch.entity)
+      {
+        engine->destroy(batch.entity);
+        utils::EntityManager::get().destroy(batch.entity);
+        batch.entity = {};
+      }
+
+      if (batch.mat_instance)
+      {
+        engine->destroy(batch.mat_instance);
+        batch.mat_instance = nullptr;
+      }
+
+      if (batch.instance_data_tex)
+      {
+        engine->destroy(batch.instance_data_tex);
+        batch.instance_data_tex = nullptr;
+      }
+    }
+    entry.batches.clear();
+
+    if (entry.vb)
+    {
+      engine->destroy(entry.vb);
+      entry.vb = nullptr;
+    }
+
+    if (entry.ib)
+    {
+      engine->destroy(entry.ib);
+      entry.ib = nullptr;
+    }
+  }
+
+  void clear_terrain_node_pool()
+  {
+    if (!engine)
+    {
+      return;
+    }
+
+    for (auto &node : terrain_node_pool)
+    {
+      if (node.in_scene && node.entity)
+      {
+        scene->remove(node.entity);
+        node.in_scene = false;
+      }
+
+      if (node.entity)
+      {
+        engine->destroy(node.entity);
+        utils::EntityManager::get().destroy(node.entity);
+        node.entity = {};
+      }
+
+      if (node.unlit_instance)
+      {
+        engine->destroy(node.unlit_instance);
+        node.unlit_instance = nullptr;
+      }
+
+      if (node.lit_instance)
+      {
+        engine->destroy(node.lit_instance);
+        node.lit_instance = nullptr;
+      }
+    }
+
+    terrain_node_pool.clear();
+    active_cdlod_nodes = 0;
+  }
+
+  void destroy_all()
+  {
+    if (!engine)
+    {
+      return;
+    }
+
+    clear_terrain_node_pool();
+
+    for (auto &[id, t_entry] : terrains)
+    {
+      destroy_terrain_textures(t_entry);
+    }
+
+    for (auto &[id, g_entry] : instanced_groups)
+    {
+      destroy_instanced_group_gpu(g_entry);
+    }
+
+    if (sky_dome_in_scene && sky_dome_entity)
+    {
+      scene->remove(sky_dome_entity);
+      sky_dome_in_scene = false;
+    }
+
+    if (sky_dome_entity)
+    {
+      engine->destroy(sky_dome_entity);
+      utils::EntityManager::get().destroy(sky_dome_entity);
+      sky_dome_entity = {};
+    }
+
+    if (sky_mat_instance)
+    {
+      engine->destroy(sky_mat_instance);
+      sky_mat_instance = nullptr;
+    }
+
+    if (sky_dome_vb)
+    {
+      engine->destroy(sky_dome_vb);
+      sky_dome_vb = nullptr;
+    }
+
+    if (sky_dome_ib)
+    {
+      engine->destroy(sky_dome_ib);
+      sky_dome_ib = nullptr;
+    }
+
+    if (shared_grid_vb)
+    {
+      engine->destroy(shared_grid_vb);
+      shared_grid_vb = nullptr;
+    }
+
+    if (shared_solid_ib)
+    {
+      engine->destroy(shared_solid_ib);
+      shared_solid_ib = nullptr;
+    }
+
+    if (shared_wire_ib)
+    {
+      engine->destroy(shared_wire_ib);
+      shared_wire_ib = nullptr;
+    }
+
+    if (fallback_white_tex)
+    {
+      engine->destroy(fallback_white_tex);
+      fallback_white_tex = nullptr;
+    }
+
+    if (sun_light_entity)
+    {
+      scene->remove(sun_light_entity);
+      engine->destroy(sun_light_entity);
+      utils::EntityManager::get().destroy(sun_light_entity);
+      sun_light_entity = {};
+    }
+
+    if (indirect_light)
+    {
+      scene->setIndirectLight(nullptr);
+      engine->destroy(indirect_light);
+      indirect_light = nullptr;
+    }
+
+    if (camera_entity)
+    {
+      engine->destroyCameraComponent(camera_entity);
+      utils::EntityManager::get().destroy(camera_entity);
+      camera_entity = {};
+    }
+
+    if (skybox)
+    {
+      scene->setSkybox(nullptr);
+      engine->destroy(skybox);
+      skybox = nullptr;
+    }
+
+    if (terrain_lit_mat)
+    {
+      engine->destroy(terrain_lit_mat);
+      terrain_lit_mat = nullptr;
+    }
+
+    if (terrain_unlit_mat)
+    {
+      engine->destroy(terrain_unlit_mat);
+      terrain_unlit_mat = nullptr;
+    }
+
+    if (instanced_obj_mat)
+    {
+      engine->destroy(instanced_obj_mat);
+      instanced_obj_mat = nullptr;
+    }
+
+    if (sky_material)
+    {
+      engine->destroy(sky_material);
+      sky_material = nullptr;
+    }
+
+    if (view)
+    {
+      engine->destroy(view);
+      view = nullptr;
+    }
+
+    if (scene)
+    {
+      engine->destroy(scene);
+      scene = nullptr;
+    }
+
+    if (renderer)
+    {
+      engine->destroy(renderer);
+      renderer = nullptr;
+    }
+
+    if (swap_chain)
+    {
+      engine->destroy(swap_chain);
+      swap_chain = nullptr;
+    }
+
+    filament::Engine::destroy(&engine);
+    engine = nullptr;
+  }
+};
+
+// --- Construction & Destruction
+
+ViewportWidget::ViewportWidget(QWidget *parent)
+    : QWidget(parent),
+      impl_(std::make_unique<Impl>()),
+      last_frame_time_(std::chrono::steady_clock::now())
+{
+  const QString platform = QGuiApplication::platformName();
+  if (platform != "offscreen" && platform != "minimal")
+  {
+    setAttribute(Qt::WA_NativeWindow);
+    setAttribute(Qt::WA_PaintOnScreen);
+    setAttribute(Qt::WA_NoSystemBackground);
+  }
   setAttribute(Qt::WA_OpaquePaintEvent);
+  setFocusPolicy(Qt::StrongFocus);
   setMouseTracking(true);
+
+  impl_->quadtree.set_max_lod_levels(max_lod_levels_);
+
+  render_timer_ = new QTimer(this);
+  connect(render_timer_, &QTimer::timeout, this, &ViewportWidget::render_frame);
 }
 
-// --- Properties
+ViewportWidget::~ViewportWidget()
+{
+  if (render_timer_)
+  {
+    render_timer_->stop();
+  }
+
+  impl_->destroy_all();
+}
+
+// --- Multi-terrain management
+
+void ViewportWidget::add_or_update_terrain(
+    const scene::TerrainLayerDescriptor &descriptor)
+{
+  if (descriptor.id.empty() || !descriptor.heightmap)
+  {
+    return;
+  }
+
+  auto &entry = impl_->terrains[descriptor.id];
+  impl_->destroy_terrain_textures(entry);
+
+  entry.descriptor = descriptor;
+  if (entry.descriptor.normal_map_rgb8.empty())
+  {
+    entry.descriptor.normal_map_rgb8 = scene::compute_normal_map_rgb8(
+        *descriptor.heightmap,
+        descriptor.lx,
+        descriptor.ly,
+        descriptor.height_scale);
+  }
+
+  entry.patch = std::make_unique<terrain::HeightmapPatch>(
+      descriptor.id,
+      descriptor.heightmap,
+      descriptor.center,
+      descriptor.lx,
+      descriptor.ly,
+      descriptor.rotation_deg);
+  entry.textures_dirty = true;
+
+  recompute_all_lods();
+}
+
+void ViewportWidget::clear_terrains()
+{
+  for (auto &[id, entry] : impl_->terrains)
+  {
+    impl_->destroy_terrain_textures(entry);
+  }
+
+  impl_->terrains.clear();
+  impl_->clear_terrain_node_pool();
+  emit lod_selection_updated(0);
+}
+
+size_t ViewportWidget::get_active_cdlod_node_count() const noexcept
+{
+  return impl_->active_cdlod_nodes;
+}
+
+size_t ViewportWidget::get_terrain_count() const noexcept
+{
+  return impl_->terrains.size();
+}
+
+void ViewportWidget::remove_terrain(const std::string &id)
+{
+  auto it = impl_->terrains.find(id);
+  if (it != impl_->terrains.end())
+  {
+    impl_->destroy_terrain_textures(it->second);
+    impl_->terrains.erase(it);
+    recompute_all_lods();
+  }
+}
+
+terrain::Vec3 ViewportWidget::sample_terrain_world_pos(const std::string &id,
+                                                       float              u,
+                                                       float v) const
+{
+  auto it = impl_->terrains.find(id);
+  if (it == impl_->terrains.end() || !it->second.patch)
+  {
+    return {0.0f, 0.0f, 0.0f};
+  }
+
+  const auto &entry = it->second;
+  const float norm_z = entry.patch->sample_elevation(u, v);
+  const float world_z_offset = norm_z * entry.descriptor.height_scale;
+
+  return entry.patch->local_to_world(u, v, world_z_offset);
+}
+
+void ViewportWidget::update_terrain_transform(const std::string   &id,
+                                              const terrain::Vec3 &center,
+                                              float                lx,
+                                              float                ly,
+                                              float                rotation_deg)
+{
+  auto it = impl_->terrains.find(id);
+  if (it == impl_->terrains.end() || !it->second.patch)
+  {
+    return;
+  }
+
+  auto &entry = it->second;
+  entry.descriptor.center = center;
+  entry.descriptor.lx = lx;
+  entry.descriptor.ly = ly;
+  entry.descriptor.rotation_deg = rotation_deg;
+
+  entry.patch->set_center(center);
+  entry.patch->set_dimensions(lx, ly);
+  entry.patch->set_rotation_deg(rotation_deg);
+
+  recompute_all_lods();
+}
+
+// --- Instanced object management (trees, rocks, scatter)
+
+void ViewportWidget::add_or_update_instanced_group(
+    const scene::InstancedObjectGroup &group)
+{
+  if (group.id.empty())
+  {
+    return;
+  }
+
+  auto &entry = impl_->instanced_groups[group.id];
+  impl_->destroy_instanced_group_gpu(entry);
+
+  entry.group = group;
+  entry.gpu_dirty = true;
+
+  if (filament_initialized_)
+  {
+    update_instanced_renderables();
+  }
+}
+
+void ViewportWidget::clear_instanced_groups()
+{
+  for (auto &[id, entry] : impl_->instanced_groups)
+  {
+    impl_->destroy_instanced_group_gpu(entry);
+  }
+
+  impl_->instanced_groups.clear();
+}
+
+size_t ViewportWidget::get_instanced_group_count() const noexcept
+{
+  return impl_->instanced_groups.size();
+}
+
+size_t ViewportWidget::get_total_object_instance_count() const noexcept
+{
+  size_t total = 0;
+  for (const auto &[id, entry] : impl_->instanced_groups)
+  {
+    total += entry.group.instances.size();
+  }
+
+  return total;
+}
+
+void ViewportWidget::remove_instanced_group(const std::string &id)
+{
+  auto it = impl_->instanced_groups.find(id);
+  if (it != impl_->instanced_groups.end())
+  {
+    impl_->destroy_instanced_group_gpu(it->second);
+    impl_->instanced_groups.erase(it);
+  }
+}
+
+// --- Sun & Sky controls
+
+const scene::SunSettings &ViewportWidget::get_sun_settings() const noexcept
+{
+  return sun_settings_;
+}
+
+void ViewportWidget::set_sun_angles(float azimuth_deg, float elevation_deg)
+{
+  sun_settings_.azimuth_deg = azimuth_deg;
+  sun_settings_.elevation_deg = elevation_deg;
+
+  if (filament_initialized_)
+  {
+    update_environment_and_sun();
+  }
+}
+
+void ViewportWidget::set_sun_settings(const scene::SunSettings &settings)
+{
+  sun_settings_ = settings;
+
+  if (filament_initialized_)
+  {
+    update_environment_and_sun();
+  }
+}
+
+// --- PBR Environment controls
+
+const scene::EnvironmentSettings &ViewportWidget::get_environment_settings()
+    const noexcept
+{
+  return env_settings_;
+}
+
+void ViewportWidget::set_atmospheric_scattering_enabled(bool enabled)
+{
+  env_settings_.atmospheric_scattering_enabled = enabled;
+
+  if (filament_initialized_)
+  {
+    update_environment_and_sun();
+  }
+}
+
+void ViewportWidget::set_environment_settings(
+    const scene::EnvironmentSettings &settings)
+{
+  env_settings_ = settings;
+
+  if (filament_initialized_)
+  {
+    update_environment_and_sun();
+    update_terrain_renderables();
+  }
+}
+
+void ViewportWidget::set_fog_enabled(bool enabled)
+{
+  env_settings_.fog_enabled = enabled;
+
+  if (filament_initialized_)
+  {
+    update_environment_and_sun();
+  }
+}
+
+void ViewportWidget::set_pbr_environment_enabled(bool enabled)
+{
+  env_settings_.pbr_enabled = enabled;
+
+  if (filament_initialized_)
+  {
+    update_environment_and_sun();
+    update_terrain_renderables();
+  }
+}
+
+void ViewportWidget::set_soft_shadows_enabled(bool enabled)
+{
+  env_settings_.soft_shadows_enabled = enabled;
+
+  if (filament_initialized_)
+  {
+    update_environment_and_sun();
+  }
+}
+
+// --- CDLOD & Shading debug controls
+
+size_t ViewportWidget::get_grid_resolution() const noexcept
+{
+  return grid_res_;
+}
+
+float ViewportWidget::get_lod_distance_scale() const noexcept
+{
+  return lod_dist_scale_;
+}
+
+uint32_t ViewportWidget::get_max_lod_levels() const noexcept
+{
+  return max_lod_levels_;
+}
+
+void ViewportWidget::set_grid_resolution(size_t resolution)
+{
+  if (grid_res_ != resolution && resolution >= 3)
+  {
+    grid_res_ = resolution;
+    if (filament_initialized_)
+    {
+      impl_->clear_terrain_node_pool();
+      update_shared_grid_mesh();
+      update_terrain_renderables();
+    }
+  }
+}
+
+void ViewportWidget::set_lod_color_debug_enabled(bool enabled)
+{
+  lod_color_debug_ = enabled;
+  if (filament_initialized_)
+  {
+    update_terrain_renderables();
+  }
+}
+
+void ViewportWidget::set_lod_distance_scale(float scale)
+{
+  lod_dist_scale_ = std::max(0.05f, scale);
+  recompute_all_lods();
+}
+
+void ViewportWidget::set_max_lod_levels(uint32_t levels)
+{
+  max_lod_levels_ = std::clamp(levels, 1u, 12u);
+  impl_->quadtree.set_max_lod_levels(max_lod_levels_);
+  recompute_all_lods();
+}
+
+void ViewportWidget::set_morphing_enabled(bool enabled)
+{
+  morphing_enabled_ = enabled;
+  if (filament_initialized_)
+  {
+    update_terrain_renderables();
+  }
+}
+
+void ViewportWidget::set_shading_enabled(bool enabled)
+{
+  shading_enabled_ = enabled;
+  if (filament_initialized_)
+  {
+    update_terrain_renderables();
+  }
+}
+
+void ViewportWidget::set_wireframe_enabled(bool enabled)
+{
+  wireframe_enabled_ = enabled;
+  if (filament_initialized_)
+  {
+    update_terrain_renderables();
+  }
+}
+
+// --- Camera & Viewport properties
 
 const QColor &ViewportWidget::get_background_color() const
 {
   return background_color_;
 }
 
-void ViewportWidget::set_background_color(const QColor &color)
+QVector3D ViewportWidget::get_camera_pos() const noexcept
 {
-  background_color_ = color;
-  update();
+  const float rad_pitch = qDegreesToRadians(camera_pitch_);
+  const float rad_yaw = qDegreesToRadians(camera_yaw_);
+
+  const float x = camera_target_.x() +
+                  camera_distance_ * std::cos(rad_pitch) * std::cos(rad_yaw);
+  const float y = camera_target_.y() +
+                  camera_distance_ * std::cos(rad_pitch) * std::sin(rad_yaw);
+  const float z = camera_target_.z() + camera_distance_ * std::sin(rad_pitch);
+
+  return QVector3D(x, y, z);
+}
+
+QVector3D ViewportWidget::get_camera_target() const noexcept
+{
+  return camera_target_;
 }
 
 float ViewportWidget::get_fps() const
@@ -41,18 +872,65 @@ float ViewportWidget::get_frame_time_ms() const
   return current_frame_time_ms_;
 }
 
+void ViewportWidget::set_background_color(const QColor &color)
+{
+  background_color_ = color;
+
+  if (filament_initialized_ && impl_->renderer)
+  {
+    filament::Renderer::ClearOptions clear_options;
+    clear_options.clearColor = {static_cast<float>(color.redF()),
+                                static_cast<float>(color.greenF()),
+                                static_cast<float>(color.blueF()),
+                                1.0f};
+    clear_options.clear = true;
+    clear_options.discard = true;
+    impl_->renderer->setClearOptions(clear_options);
+  }
+}
+
+void ViewportWidget::set_camera_orbit(const QVector3D &target,
+                                      float            distance,
+                                      float            yaw_deg,
+                                      float            pitch_deg)
+{
+  camera_target_ = target;
+  camera_distance_ = std::clamp(distance, 5.0f, 15000.0f);
+  camera_yaw_ = yaw_deg;
+  camera_pitch_ = std::clamp(pitch_deg, -89.0f, 89.0f);
+
+  recompute_all_lods();
+}
+
 // --- Protected Qt events
 
 void ViewportWidget::mouseMoveEvent(QMouseEvent *event)
 {
-  if (is_dragging_)
-  {
-    QPoint delta = event->pos() - last_mouse_pos_;
-    last_mouse_pos_ = event->pos();
+  const QPoint delta = event->pos() - last_mouse_pos_;
+  last_mouse_pos_ = event->pos();
 
-    // placeholder hook for camera rotation or panning
-    Q_UNUSED(delta);
-    update();
+  if (event->buttons() & Qt::LeftButton)
+  {
+    camera_yaw_ -= static_cast<float>(delta.x()) * 0.4f;
+    camera_pitch_ += static_cast<float>(delta.y()) * 0.4f;
+    camera_pitch_ = std::clamp(camera_pitch_, -89.0f, 89.0f);
+    recompute_all_lods();
+  }
+  else if (event->buttons() & (Qt::RightButton | Qt::MiddleButton))
+  {
+    const float rad_yaw = qDegreesToRadians(camera_yaw_);
+    const float rad_pitch = qDegreesToRadians(camera_pitch_);
+
+    // Camera view-plane right and up vectors in 3D world space (Z-up)
+    const QVector3D cam_right(-std::sin(rad_yaw), std::cos(rad_yaw), 0.0f);
+    const QVector3D cam_up(-std::sin(rad_pitch) * std::cos(rad_yaw),
+                           -std::sin(rad_pitch) * std::sin(rad_yaw),
+                           std::cos(rad_pitch));
+
+    const float pan_speed = camera_distance_ * 0.0014f;
+    camera_target_ -= cam_right * (static_cast<float>(delta.x()) * pan_speed);
+    camera_target_ += cam_up * (static_cast<float>(delta.y()) * pan_speed);
+    recompute_all_lods();
   }
 
   QWidget::mouseMoveEvent(event);
@@ -60,48 +938,1292 @@ void ViewportWidget::mouseMoveEvent(QMouseEvent *event)
 
 void ViewportWidget::mousePressEvent(QMouseEvent *event)
 {
-  if (event->button() == Qt::LeftButton || event->button() == Qt::MiddleButton)
-  {
-    is_dragging_ = true;
-    last_mouse_pos_ = event->pos();
-  }
-
+  is_dragging_ = true;
+  last_mouse_pos_ = event->pos();
   QWidget::mousePressEvent(event);
 }
 
 void ViewportWidget::mouseReleaseEvent(QMouseEvent *event)
 {
-  if (event->button() == Qt::LeftButton || event->button() == Qt::MiddleButton)
-  {
-    is_dragging_ = false;
-  }
-
+  is_dragging_ = false;
   QWidget::mouseReleaseEvent(event);
 }
 
 void ViewportWidget::paintEvent(QPaintEvent *event)
 {
   Q_UNUSED(event);
+}
 
-  QPainter painter(this);
-  painter.fillRect(rect(), background_color_);
-
-  // draw temporary 3D placeholder grid / text
-  painter.setPen(QColor(120, 120, 130));
-  painter.drawText(rect(), Qt::AlignCenter, "Oros 3D Viewport");
+QPaintEngine *ViewportWidget::paintEngine() const
+{
+  return nullptr;
 }
 
 void ViewportWidget::resizeEvent(QResizeEvent *event)
 {
   QWidget::resizeEvent(event);
+
+  if (filament_initialized_ && impl_->view)
+  {
+    impl_->view->setViewport(
+        filament::Viewport(0, 0, std::max(1, width()), std::max(1, height())));
+    update_camera();
+  }
+}
+
+void ViewportWidget::showEvent(QShowEvent *event)
+{
+  QWidget::showEvent(event);
+
+  if (!filament_initialized_)
+  {
+    // Avoid creating OpenGL/X11 swapchains in headless offscreen unit tests
+    const QString platform = QGuiApplication::platformName();
+    if (platform != "offscreen" && platform != "minimal")
+    {
+      init_filament();
+    }
+  }
 }
 
 void ViewportWidget::wheelEvent(QWheelEvent *event)
 {
-  // placeholder hook for camera zoom
-  update();
+  const float delta = static_cast<float>(event->angleDelta().y());
+  camera_distance_ *= (delta > 0.0f) ? 0.88f : 1.12f;
+  camera_distance_ = std::clamp(camera_distance_, 10.0f, 15000.0f);
+  recompute_all_lods();
 
   QWidget::wheelEvent(event);
+}
+
+// --- Internal Filament methods
+
+void ViewportWidget::init_filament()
+{
+  if (filament_initialized_)
+  {
+    return;
+  }
+
+  filament::Engine::Config engine_config;
+  engine_config.driverHandleArenaSizeMB = 32;
+  engine_config.commandBufferSizeMB = 32;
+  engine_config.perRenderPassArenaSizeMB = 32;
+
+  impl_->engine = filament::Engine::Builder()
+                      .backend(filament::backend::Backend::OPENGL)
+                      .config(&engine_config)
+                      .build();
+  if (!impl_->engine)
+  {
+    Logger::log()->error("Failed to create Filament engine in ViewportWidget!");
+    return;
+  }
+
+  void *native_window = reinterpret_cast<void *>(winId());
+  impl_->swap_chain = impl_->engine->createSwapChain(native_window);
+  impl_->renderer = impl_->engine->createRenderer();
+  impl_->scene = impl_->engine->createScene();
+  impl_->view = impl_->engine->createView();
+
+  // Clear options
+  filament::Renderer::ClearOptions clear_options;
+  clear_options.clearColor = {static_cast<float>(background_color_.redF()),
+                              static_cast<float>(background_color_.greenF()),
+                              static_cast<float>(background_color_.blueF()),
+                              1.0f};
+  clear_options.clear = true;
+  clear_options.discard = true;
+  impl_->renderer->setClearOptions(clear_options);
+
+  // View configuration
+  impl_->view->setPostProcessingEnabled(true);
+  impl_->view->setShadowType(filament::ShadowType::PCF);
+
+  filament::View::SoftShadowOptions soft_shadow_options;
+  soft_shadow_options.penumbraScale = 1.2f;
+  soft_shadow_options.penumbraRatioScale = 1.2f;
+  impl_->view->setSoftShadowOptions(soft_shadow_options);
+
+  // Skybox fallback
+  impl_->skybox = filament::Skybox::Builder()
+                      .color({0.14f, 0.16f, 0.22f, 1.0f})
+                      .build(*impl_->engine);
+  impl_->scene->setSkybox(impl_->skybox);
+
+  // Camera
+  impl_->camera_entity = utils::EntityManager::get().create();
+  impl_->camera = impl_->engine->createCamera(impl_->camera_entity);
+  impl_->view->setCamera(impl_->camera);
+  impl_->view->setScene(impl_->scene);
+  impl_->view->setViewport(
+      filament::Viewport(0, 0, std::max(1, width()), std::max(1, height())));
+
+  // Directional Sun Light with 4-cascade soft shadows
+  impl_->sun_light_entity = utils::EntityManager::get().create();
+
+  filament::LightManager::ShadowOptions shadow_options;
+  shadow_options.mapSize = 4096;
+  shadow_options.shadowCascades = 4;
+  shadow_options.shadowNearHint = 10.0f;
+  shadow_options.shadowFar = 6000.0f;
+  shadow_options.shadowFarHint = 6000.0f;
+  shadow_options.screenSpaceContactShadows = true;
+
+  filament::LightManager::ShadowCascades::computePracticalSplits(
+      shadow_options.cascadeSplitPositions,
+      shadow_options.shadowCascades,
+      shadow_options.shadowNearHint,
+      shadow_options.shadowFar,
+      0.35f);
+
+  filament::LightManager::Builder(filament::LightManager::Type::SUN)
+      .color(
+          filament::Color::toLinear<filament::ACCURATE>({1.0f, 0.98f, 0.92f}))
+      .intensity(sun_settings_.intensity)
+      .direction({-0.5f, -0.3f, -0.8f})
+      .sunAngularRadius(sun_settings_.sun_angular_radius_deg)
+      .sunHaloSize(10.0f)
+      .sunHaloFalloff(80.0f)
+      .castShadows(env_settings_.soft_shadows_enabled)
+      .shadowOptions(shadow_options)
+      .build(*impl_->engine, impl_->sun_light_entity);
+  impl_->scene->addEntity(impl_->sun_light_entity);
+
+  // Compile Materials
+  impl_->terrain_unlit_mat = filament::Material::Builder()
+                                 .package(MATERIAL_TERRAIN_UNLIT_PKG,
+                                          sizeof(MATERIAL_TERRAIN_UNLIT_PKG))
+                                 .build(*impl_->engine);
+
+  impl_->terrain_lit_mat = filament::Material::Builder()
+                               .package(MATERIAL_TERRAIN_LIT_PKG,
+                                        sizeof(MATERIAL_TERRAIN_LIT_PKG))
+                               .build(*impl_->engine);
+
+  impl_->instanced_obj_mat = filament::Material::Builder()
+                                 .package(MATERIAL_INSTANCED_OBJECT_PKG,
+                                          sizeof(MATERIAL_INSTANCED_OBJECT_PKG))
+                                 .build(*impl_->engine);
+
+  impl_->sky_material = filament::Material::Builder()
+                            .package(MATERIAL_SKY_ATMOSPHERE_PKG,
+                                     sizeof(MATERIAL_SKY_ATMOSPHERE_PKG))
+                            .build(*impl_->engine);
+
+  // Create fallback 1x1 white texture
+  impl_->fallback_white_tex = filament::Texture::Builder()
+                                  .width(1)
+                                  .height(1)
+                                  .levels(1)
+                                  .sampler(
+                                      filament::Texture::Sampler::SAMPLER_2D)
+                                  .format(
+                                      filament::Texture::InternalFormat::RGB8)
+                                  .build(*impl_->engine);
+
+  auto *white_px = new std::vector<uint8_t>{255, 255, 255};
+  filament::Texture::PixelBufferDescriptor white_buf(
+      white_px->data(),
+      white_px->size(),
+      filament::Texture::Format::RGB,
+      filament::Texture::Type::UBYTE,
+      [](void * /*buffer*/, size_t /*size*/, void *user)
+      { delete static_cast<std::vector<uint8_t> *>(user); },
+      white_px);
+  impl_->fallback_white_tex->setImage(*impl_->engine, 0, std::move(white_buf));
+
+  // Build Sky Dome Sphere Mesh (radius = 9500)
+  {
+    const uint32_t lat_steps = 24;
+    const uint32_t lon_steps = 40;
+    const float    sky_radius = 6000.0f;
+    const float    pi = std::numbers::pi_v<float>;
+
+    std::vector<filament::math::float3> sky_verts;
+    std::vector<uint32_t>               sky_indices;
+
+    for (uint32_t lat = 0; lat <= lat_steps; ++lat)
+    {
+      const float theta = static_cast<float>(lat) /
+                          static_cast<float>(lat_steps) * pi;
+      const float sin_t = std::sin(theta);
+      const float cos_t = std::cos(theta);
+
+      for (uint32_t lon = 0; lon <= lon_steps; ++lon)
+      {
+        const float phi = static_cast<float>(lon) /
+                          static_cast<float>(lon_steps) * (2.0f * pi);
+        sky_verts.push_back({sky_radius * sin_t * std::cos(phi),
+                             sky_radius * sin_t * std::sin(phi),
+                             sky_radius * cos_t});
+      }
+    }
+
+    const uint32_t stride = lon_steps + 1;
+    for (uint32_t lat = 0; lat < lat_steps; ++lat)
+    {
+      for (uint32_t lon = 0; lon < lon_steps; ++lon)
+      {
+        const uint32_t i0 = lat * stride + lon;
+        const uint32_t i1 = i0 + 1;
+        const uint32_t i2 = (lat + 1) * stride + lon;
+        const uint32_t i3 = i2 + 1;
+
+        sky_indices.push_back(i0);
+        sky_indices.push_back(i1);
+        sky_indices.push_back(i2);
+
+        sky_indices.push_back(i1);
+        sky_indices.push_back(i3);
+        sky_indices.push_back(i2);
+      }
+    }
+
+    impl_->sky_dome_index_count = static_cast<uint32_t>(sky_indices.size());
+    impl_->sky_dome_vb = filament::VertexBuffer::Builder()
+                             .vertexCount(
+                                 static_cast<uint32_t>(sky_verts.size()))
+                             .bufferCount(1)
+                             .attribute(
+                                 filament::VertexAttribute::POSITION,
+                                 0,
+                                 filament::VertexBuffer::AttributeType::FLOAT3,
+                                 0,
+                                 sizeof(filament::math::float3))
+                             .build(*impl_->engine);
+
+    auto *sv_copy = new std::vector<filament::math::float3>(
+        std::move(sky_verts));
+    impl_->sky_dome_vb->setBufferAt(
+        *impl_->engine,
+        0,
+        filament::VertexBuffer::BufferDescriptor(
+            sv_copy->data(),
+            sv_copy->size() * sizeof(filament::math::float3),
+            [](void * /*b*/, size_t /*s*/, void *u)
+            { delete static_cast<std::vector<filament::math::float3> *>(u); },
+            sv_copy));
+
+    impl_->sky_dome_ib = filament::IndexBuffer::Builder()
+                             .indexCount(impl_->sky_dome_index_count)
+                             .bufferType(filament::IndexBuffer::IndexType::UINT)
+                             .build(*impl_->engine);
+
+    auto *si_copy = new std::vector<uint32_t>(std::move(sky_indices));
+    impl_->sky_dome_ib->setBuffer(
+        *impl_->engine,
+        filament::IndexBuffer::BufferDescriptor(
+            si_copy->data(),
+            si_copy->size() * sizeof(uint32_t),
+            [](void * /*b*/, size_t /*s*/, void *u)
+            { delete static_cast<std::vector<uint32_t> *>(u); },
+            si_copy));
+
+    impl_->sky_dome_entity = utils::EntityManager::get().create();
+    impl_->sky_mat_instance = impl_->sky_material->createInstance();
+
+    filament::RenderableManager::Builder(1)
+        .boundingBox({{-100000.0f, -100000.0f, -100000.0f},
+                      {100000.0f, 100000.0f, 100000.0f}})
+        .material(0, impl_->sky_mat_instance)
+        .geometry(0,
+                  filament::RenderableManager::PrimitiveType::TRIANGLES,
+                  impl_->sky_dome_vb,
+                  impl_->sky_dome_ib,
+                  0,
+                  impl_->sky_dome_index_count)
+        .priority(6)
+        .castShadows(false)
+        .receiveShadows(false)
+        .fog(false)
+        .culling(false)
+        .build(*impl_->engine, impl_->sky_dome_entity);
+  }
+
+  update_shared_grid_mesh();
+
+  filament_initialized_ = true;
+
+  update_camera();
+  update_environment_and_sun();
+  recompute_all_lods();
+  update_instanced_renderables();
+
+  render_timer_->start(16);
+}
+
+void ViewportWidget::recompute_all_lods()
+{
+  const QVector3D                eye = get_camera_pos();
+  terrain::CDLODSelectionContext ctx;
+  ctx.camera_pos = terrain::Vec3{eye.x(), eye.y(), eye.z()};
+  ctx.morph_ratio = 0.66f;
+
+  float base_dist = 75.0f * lod_dist_scale_;
+  for (uint32_t i = 0; i < max_lod_levels_; ++i)
+  {
+    ctx.lod_distances.push_back(base_dist);
+    base_dist *= 2.0f;
+  }
+
+  size_t total_nodes = 0;
+  for (auto &[id, entry] : impl_->terrains)
+  {
+    if (entry.patch)
+    {
+      entry.lod_instances = impl_->quadtree.select_lod(*entry.patch, ctx);
+      total_nodes += entry.lod_instances.size();
+    }
+  }
+
+  impl_->active_cdlod_nodes = total_nodes;
+
+  if (filament_initialized_)
+  {
+    update_camera();
+    update_sky_dome();
+    update_terrain_renderables();
+  }
+
+  emit camera_moved(eye.x(), eye.y(), eye.z());
+  emit lod_selection_updated(total_nodes);
+}
+
+void ViewportWidget::render_frame()
+{
+  if (!filament_initialized_ || !impl_->renderer || !impl_->swap_chain ||
+      !impl_->view)
+  {
+    return;
+  }
+
+  const auto   now = std::chrono::steady_clock::now();
+  const double dt_ms =
+      std::chrono::duration<double, std::milli>(now - last_frame_time_).count();
+  last_frame_time_ = now;
+
+  if (dt_ms > 0.1)
+  {
+    const float instant_fps = static_cast<float>(1000.0 / dt_ms);
+    current_fps_ = (current_fps_ < 1.0f)
+                       ? instant_fps
+                       : (0.9f * current_fps_ + 0.1f * instant_fps);
+    current_frame_time_ms_ = static_cast<float>(dt_ms);
+    emit fps_updated(current_fps_, current_frame_time_ms_);
+  }
+
+  if (impl_->renderer->beginFrame(impl_->swap_chain))
+  {
+    impl_->renderer->render(impl_->view);
+    impl_->renderer->endFrame();
+  }
+}
+
+void ViewportWidget::update_camera()
+{
+  if (!impl_->camera)
+  {
+    return;
+  }
+
+  const QVector3D eye = get_camera_pos();
+  const float     aspect = static_cast<float>(std::max(1, width())) /
+                       static_cast<float>(std::max(1, height()));
+
+  impl_->camera->setProjection(45.0,
+                               aspect,
+                               5.0,
+                               18000.0,
+                               filament::Camera::Fov::VERTICAL);
+  impl_->camera->lookAt(filament::math::float3(eye.x(), eye.y(), eye.z()),
+                        filament::math::float3(camera_target_.x(),
+                                               camera_target_.y(),
+                                               camera_target_.z()),
+                        filament::math::float3(0.0f, 0.0f, 1.0f));
+}
+
+void ViewportWidget::update_environment_and_sun()
+{
+  if (!filament_initialized_ || !impl_->engine || !impl_->view)
+  {
+    return;
+  }
+
+  const bool pbr = env_settings_.pbr_enabled;
+
+  // 1. Compute Sun Direction and Color
+  const terrain::Vec3 sun_ray_dir = scene::compute_sun_direction(
+      sun_settings_.azimuth_deg,
+      sun_settings_.elevation_deg);
+
+  const terrain::Vec3 sun_color = sun_settings_.auto_color_temperature
+                                      ? scene::compute_sun_color_from_elevation(
+                                            sun_settings_.elevation_deg)
+                                      : sun_settings_.base_color;
+
+  const float intensity_mult = sun_settings_.auto_color_temperature
+                                   ? scene::compute_sun_intensity_multiplier(
+                                         sun_settings_.elevation_deg)
+                                   : 1.0f;
+
+  const bool cast_shadows = pbr && env_settings_.soft_shadows_enabled;
+
+  impl_->view->setShadowingEnabled(cast_shadows);
+
+  if (impl_->sun_light_entity)
+  {
+    auto &lm = impl_->engine->getLightManager();
+    auto  li = lm.getInstance(impl_->sun_light_entity);
+    if (li)
+    {
+      lm.setDirection(
+          li,
+          filament::math::float3(sun_ray_dir.x, sun_ray_dir.y, sun_ray_dir.z));
+      lm.setColor(li,
+                  filament::Color::toLinear<filament::ACCURATE>(
+                      {sun_color.x, sun_color.y, sun_color.z}));
+      lm.setIntensity(li, sun_settings_.intensity * intensity_mult);
+      lm.setShadowCaster(li, cast_shadows);
+      lm.setSunAngularRadius(li,
+                             sun_settings_.render_sun_disk
+                                 ? sun_settings_.sun_angular_radius_deg
+                                 : 0.0f);
+    }
+  }
+
+  // 2. Dynamic Indirect Light (Hemispherical Sky Irradiance)
+  if (impl_->indirect_light)
+  {
+    impl_->scene->setIndirectLight(nullptr);
+    impl_->engine->destroy(impl_->indirect_light);
+    impl_->indirect_light = nullptr;
+  }
+
+  const float day_factor = std::clamp((sun_settings_.elevation_deg + 8.0f) /
+                                          60.0f,
+                                      0.08f,
+                                      1.0f);
+
+  // 2-band (4-coefficient) spherical harmonics in Z-up world space:
+  // Band 0: omnidirectional sky ambient
+  // Band 1 (+Z up): bright sky dome above (+Z) and darker ground bounce below
+  // (-Z)
+  const filament::math::float3 sky_irradiance{
+      (0.32f + 0.14f * sun_color.x) * day_factor,
+      (0.40f + 0.10f * sun_color.y) * day_factor,
+      0.54f * day_factor};
+  const filament::math::float3 z_hemisphere{0.10f * day_factor,
+                                            0.14f * day_factor,
+                                            0.22f * day_factor};
+
+  filament::math::float3 ambient_sh[4] = {sky_irradiance,
+                                          {0.0f, 0.0f, 0.0f},
+                                          z_hemisphere,
+                                          {0.0f, 0.0f, 0.0f}};
+
+  impl_->indirect_light = filament::IndirectLight::Builder()
+                              .irradiance(2, ambient_sh)
+                              .intensity(pbr ? 28000.0f : 35000.0f)
+                              .build(*impl_->engine);
+  impl_->scene->setIndirectLight(impl_->indirect_light);
+
+  // 3. Ambient Occlusion (GTAO)
+  filament::View::AmbientOcclusionOptions ao_options =
+      impl_->view->getAmbientOcclusionOptions();
+  ao_options.enabled = pbr && env_settings_.ambient_occlusion_enabled;
+  ao_options.aoType =
+      filament::View::AmbientOcclusionOptions::AmbientOcclusionType::GTAO;
+  ao_options.quality = filament::View::QualityLevel::HIGH;
+  ao_options.lowPassFilter = filament::View::QualityLevel::HIGH;
+  ao_options.upsampling = filament::View::QualityLevel::HIGH;
+  ao_options.bentNormals = true;
+  impl_->view->setAmbientOcclusionOptions(ao_options);
+
+  // 4. Atmospheric / Height Fog with Sun In-Scattering
+  // Align Filament's Y-up fog volume with our Z-up world coordinate system
+  const utils::Entity fog_entity = impl_->view->getFogEntity();
+  if (fog_entity)
+  {
+    auto &tm = impl_->engine->getTransformManager();
+    if (!tm.hasComponent(fog_entity))
+    {
+      tm.create(fog_entity);
+    }
+    auto fog_ti = tm.getInstance(fog_entity);
+
+    // Maps world Z (elevation) into fog local Y (altitude):
+    // local_x = world_x, local_y = world_z, local_z = -world_y
+    filament::math::mat4f z_up_to_y_up(
+        filament::math::float4(1.0f, 0.0f, 0.0f, 0.0f),
+        filament::math::float4(0.0f, 0.0f, 1.0f, 0.0f),
+        filament::math::float4(0.0f, -1.0f, 0.0f, 0.0f),
+        filament::math::float4(0.0f, 0.0f, 0.0f, 1.0f));
+    tm.setTransform(fog_ti, z_up_to_y_up);
+  }
+
+  filament::View::FogOptions fog_options;
+  fog_options.enabled = pbr && env_settings_.fog_enabled;
+  fog_options.distance = env_settings_.fog_start;
+  fog_options.cutOffDistance = 9000.0f;
+  fog_options.density = env_settings_.fog_density;
+  fog_options.height = env_settings_.fog_height;
+  fog_options.heightFalloff = env_settings_.fog_height_falloff;
+  fog_options.maximumOpacity = 0.88f;
+
+  // Match fog tint to horizon scattering color
+  const float sunset_blend = std::clamp(
+      1.0f - std::abs(sun_settings_.elevation_deg - 5.0f) / 25.0f,
+      0.0f,
+      1.0f);
+  const float fog_r = (0.50f * (1.0f - sunset_blend) + 0.92f * sunset_blend) *
+                      day_factor;
+  const float fog_g = (0.68f * (1.0f - sunset_blend) + 0.52f * sunset_blend) *
+                      day_factor;
+  const float fog_b = (0.88f * (1.0f - sunset_blend) + 0.35f * sunset_blend) *
+                      day_factor;
+  fog_options.color = {fog_r, fog_g, fog_b};
+
+  // Disable Filament's built-in fog in-scattering pow(max(dot, 0.0), size)
+  // because GLSL pow(0.0, size) evaluates to NaN when looking away from the
+  // sun; Mie forward scattering is already computed in sky_atmosphere.mat.
+  fog_options.inScatteringSize = -1.0f;
+
+  impl_->view->setFogOptions(fog_options);
+
+  // 5. Update Atmospheric Sky Dome
+  update_sky_dome();
+}
+
+void ViewportWidget::update_instanced_renderables()
+{
+  if (!filament_initialized_ || !impl_->engine || !impl_->instanced_obj_mat)
+  {
+    return;
+  }
+
+  filament::TextureSampler nearest_sampler(
+      filament::TextureSampler::MinFilter::NEAREST,
+      filament::TextureSampler::MagFilter::NEAREST,
+      filament::TextureSampler::WrapMode::CLAMP_TO_EDGE);
+
+  for (auto &[id, entry] : impl_->instanced_groups)
+  {
+    if (!entry.gpu_dirty)
+    {
+      continue;
+    }
+
+    impl_->destroy_instanced_group_gpu(entry);
+
+    if (entry.group.instances.empty())
+    {
+      entry.gpu_dirty = false;
+      continue;
+    }
+
+    // Resolve mesh geometry
+    scene::MeshGeometryData mesh;
+    switch (entry.group.mesh_type)
+    {
+    case scene::ScatterMeshType::ROCK:
+      mesh = scene::ScatterMeshFactory::create_rock_mesh();
+      break;
+    case scene::ScatterMeshType::PINE_TREE:
+      mesh = scene::ScatterMeshFactory::create_pine_tree_mesh();
+      break;
+    case scene::ScatterMeshType::DECIDUOUS_TREE:
+      mesh = scene::ScatterMeshFactory::create_deciduous_tree_mesh();
+      break;
+    case scene::ScatterMeshType::CUSTOM: mesh = entry.group.custom_mesh; break;
+    }
+
+    if (mesh.positions.empty() || mesh.indices.empty())
+    {
+      entry.gpu_dirty = false;
+      continue;
+    }
+
+    const size_t                        v_count = mesh.positions.size();
+    std::vector<filament::math::float3> positions(v_count);
+    std::vector<filament::math::quatf>  tangents(v_count);
+    std::vector<filament::math::float4> colors(v_count);
+
+    for (size_t i = 0; i < v_count; ++i)
+    {
+      positions[i] = {mesh.positions[i].x,
+                      mesh.positions[i].y,
+                      mesh.positions[i].z};
+
+      const terrain::Vec3 n = (i < mesh.normals.size())
+                                  ? mesh.normals[i]
+                                  : terrain::Vec3{0.0f, 0.0f, 1.0f};
+      tangents[i] = pack_normal_to_tangent_frame(n);
+
+      const terrain::Vec3 c = (i < mesh.colors.size())
+                                  ? mesh.colors[i]
+                                  : terrain::Vec3{1.0f, 1.0f, 1.0f};
+      colors[i] = {c.x, c.y, c.z, 1.0f};
+    }
+
+    entry.vb = filament::VertexBuffer::Builder()
+                   .vertexCount(static_cast<uint32_t>(v_count))
+                   .bufferCount(3)
+                   .attribute(filament::VertexAttribute::POSITION,
+                              0,
+                              filament::VertexBuffer::AttributeType::FLOAT3,
+                              0,
+                              sizeof(filament::math::float3))
+                   .attribute(filament::VertexAttribute::TANGENTS,
+                              1,
+                              filament::VertexBuffer::AttributeType::FLOAT4,
+                              0,
+                              sizeof(filament::math::quatf))
+                   .attribute(filament::VertexAttribute::COLOR,
+                              2,
+                              filament::VertexBuffer::AttributeType::FLOAT4,
+                              0,
+                              sizeof(filament::math::float4))
+                   .build(*impl_->engine);
+
+    auto *pos_copy = new std::vector<filament::math::float3>(
+        std::move(positions));
+    entry.vb->setBufferAt(
+        *impl_->engine,
+        0,
+        filament::VertexBuffer::BufferDescriptor(
+            pos_copy->data(),
+            pos_copy->size() * sizeof(filament::math::float3),
+            [](void * /*b*/, size_t /*s*/, void *u)
+            { delete static_cast<std::vector<filament::math::float3> *>(u); },
+            pos_copy));
+
+    auto *tan_copy = new std::vector<filament::math::quatf>(
+        std::move(tangents));
+    entry.vb->setBufferAt(
+        *impl_->engine,
+        1,
+        filament::VertexBuffer::BufferDescriptor(
+            tan_copy->data(),
+            tan_copy->size() * sizeof(filament::math::quatf),
+            [](void * /*b*/, size_t /*s*/, void *u)
+            { delete static_cast<std::vector<filament::math::quatf> *>(u); },
+            tan_copy));
+
+    auto *col_copy = new std::vector<filament::math::float4>(std::move(colors));
+    entry.vb->setBufferAt(
+        *impl_->engine,
+        2,
+        filament::VertexBuffer::BufferDescriptor(
+            col_copy->data(),
+            col_copy->size() * sizeof(filament::math::float4),
+            [](void * /*b*/, size_t /*s*/, void *u)
+            { delete static_cast<std::vector<filament::math::float4> *>(u); },
+            col_copy));
+
+    entry.index_count = static_cast<uint32_t>(mesh.indices.size());
+    entry.ib = filament::IndexBuffer::Builder()
+                   .indexCount(entry.index_count)
+                   .bufferType(filament::IndexBuffer::IndexType::UINT)
+                   .build(*impl_->engine);
+
+    auto *idx_copy = new std::vector<uint32_t>(std::move(mesh.indices));
+    entry.ib->setBuffer(*impl_->engine,
+                        filament::IndexBuffer::BufferDescriptor(
+                            idx_copy->data(),
+                            idx_copy->size() * sizeof(uint32_t),
+                            [](void * /*b*/, size_t /*s*/, void *u)
+                            { delete static_cast<std::vector<uint32_t> *>(u); },
+                            idx_copy));
+
+    // Split instances into batches of up to MAX_INSTANCES_PER_BATCH (16384)
+    const size_t total_inst = entry.group.instances.size();
+    const size_t batch_count = (total_inst + MAX_INSTANCES_PER_BATCH - 1) /
+                               MAX_INSTANCES_PER_BATCH;
+
+    entry.batches.resize(batch_count);
+
+    for (size_t b = 0; b < batch_count; ++b)
+    {
+      const size_t start_idx = b * MAX_INSTANCES_PER_BATCH;
+      const size_t count = std::min(MAX_INSTANCES_PER_BATCH,
+                                    total_inst - start_idx);
+
+      const uint32_t tex_w = static_cast<uint32_t>(INSTANCE_TEX_WIDTH * 2);
+      const uint32_t tex_h = static_cast<uint32_t>(
+          (count + INSTANCE_TEX_WIDTH - 1) / INSTANCE_TEX_WIDTH);
+
+      auto *tex_data = new std::vector<filament::math::float4>(
+          static_cast<size_t>(tex_w) * tex_h,
+          filament::math::float4(0.0f));
+
+      float min_x = std::numeric_limits<float>::max();
+      float min_y = std::numeric_limits<float>::max();
+      float min_z = std::numeric_limits<float>::max();
+      float max_x = std::numeric_limits<float>::lowest();
+      float max_y = std::numeric_limits<float>::lowest();
+      float max_z = std::numeric_limits<float>::lowest();
+
+      for (size_t i = 0; i < count; ++i)
+      {
+        const auto  &inst = entry.group.instances[start_idx + i];
+        const size_t tx = i % INSTANCE_TEX_WIDTH;
+        const size_t ty = i / INSTANCE_TEX_WIDTH;
+        const size_t pixel_base = ty * tex_w + tx * 2;
+
+        const float rad = inst.rotation_deg *
+                          (std::numbers::pi_v<float> / 180.0f);
+        (*tex_data)[pixel_base + 0] = {inst.position.x,
+                                       inst.position.y,
+                                       inst.position.z,
+                                       inst.scale};
+        (*tex_data)[pixel_base + 1] = {std::cos(rad),
+                                       std::sin(rad),
+                                       0.0f,
+                                       0.0f};
+
+        const float pad = 25.0f * std::abs(inst.scale);
+        min_x = std::min(min_x, inst.position.x - pad);
+        min_y = std::min(min_y, inst.position.y - pad);
+        min_z = std::min(min_z, inst.position.z - pad);
+        max_x = std::max(max_x, inst.position.x + pad);
+        max_y = std::max(max_y, inst.position.y + pad);
+        max_z = std::max(max_z, inst.position.z + pad);
+      }
+
+      auto &batch = entry.batches[b];
+      batch.instance_data_tex =
+          filament::Texture::Builder()
+              .width(tex_w)
+              .height(tex_h)
+              .levels(1)
+              .sampler(filament::Texture::Sampler::SAMPLER_2D)
+              .format(filament::Texture::InternalFormat::RGBA32F)
+              .build(*impl_->engine);
+
+      filament::Texture::PixelBufferDescriptor pbd(
+          tex_data->data(),
+          tex_data->size() * sizeof(filament::math::float4),
+          filament::Texture::Format::RGBA,
+          filament::Texture::Type::FLOAT,
+          [](void * /*buf*/, size_t /*sz*/, void *user)
+          { delete static_cast<std::vector<filament::math::float4> *>(user); },
+          tex_data);
+      batch.instance_data_tex->setImage(*impl_->engine, 0, std::move(pbd));
+
+      batch.mat_instance = impl_->instanced_obj_mat->createInstance();
+      batch.mat_instance->setParameter("instanceDataMap",
+                                       batch.instance_data_tex,
+                                       nearest_sampler);
+      batch.mat_instance->setParameter("instanceTexWidth", INSTANCE_TEX_WIDTH);
+      batch.mat_instance->setParameter(
+          "baseColorTint",
+          filament::math::float3(entry.group.base_color.x,
+                                 entry.group.base_color.y,
+                                 entry.group.base_color.z));
+      batch.mat_instance->setParameter("roughness", entry.group.roughness);
+      batch.mat_instance->setParameter("metallic", entry.group.metallic);
+
+      batch.entity = utils::EntityManager::get().create();
+
+      filament::Box batch_box;
+      batch_box.set({min_x, min_y, min_z}, {max_x, max_y, max_z});
+
+      filament::RenderableManager::Builder(1)
+          .boundingBox(batch_box)
+          .material(0, batch.mat_instance)
+          .geometry(0,
+                    filament::RenderableManager::PrimitiveType::TRIANGLES,
+                    entry.vb,
+                    entry.ib,
+                    0,
+                    entry.index_count)
+          .instances(count)
+          .castShadows(true)
+          .receiveShadows(true)
+          .culling(false)
+          .build(*impl_->engine, batch.entity);
+
+      impl_->scene->addEntity(batch.entity);
+      batch.in_scene = true;
+    }
+
+    entry.gpu_dirty = false;
+  }
+}
+
+void ViewportWidget::update_shared_grid_mesh()
+{
+  if (!impl_->engine)
+  {
+    return;
+  }
+
+  if (impl_->shared_grid_vb)
+  {
+    impl_->engine->destroy(impl_->shared_grid_vb);
+    impl_->shared_grid_vb = nullptr;
+  }
+
+  if (impl_->shared_solid_ib)
+  {
+    impl_->engine->destroy(impl_->shared_solid_ib);
+    impl_->shared_solid_ib = nullptr;
+  }
+
+  if (impl_->shared_wire_ib)
+  {
+    impl_->engine->destroy(impl_->shared_wire_ib);
+    impl_->shared_wire_ib = nullptr;
+  }
+
+  const auto   grid = terrain::GridMeshFactory::create_unit_grid(grid_res_);
+  const size_t vertex_count = grid.vertices.size();
+
+  std::vector<filament::math::float3> positions(vertex_count);
+  for (size_t i = 0; i < vertex_count; ++i)
+  {
+    positions[i] = {grid.vertices[i].u, grid.vertices[i].v, 0.0f};
+  }
+
+  filament::math::mat3f tbn;
+  tbn[0] = filament::math::float3(1.0f, 0.0f, 0.0f);
+  tbn[1] = filament::math::float3(0.0f, 1.0f, 0.0f);
+  tbn[2] = filament::math::float3(0.0f, 0.0f, 1.0f);
+  const filament::math::quatf flat_tangent =
+      filament::math::mat3f::packTangentFrame(tbn);
+  std::vector<filament::math::quatf> tangents(vertex_count, flat_tangent);
+
+  impl_->shared_grid_vb = filament::VertexBuffer::Builder()
+                              .vertexCount(static_cast<uint32_t>(vertex_count))
+                              .bufferCount(2)
+                              .attribute(
+                                  filament::VertexAttribute::POSITION,
+                                  0,
+                                  filament::VertexBuffer::AttributeType::FLOAT3,
+                                  0,
+                                  sizeof(filament::math::float3))
+                              .attribute(
+                                  filament::VertexAttribute::TANGENTS,
+                                  1,
+                                  filament::VertexBuffer::AttributeType::FLOAT4,
+                                  0,
+                                  sizeof(filament::math::quatf))
+                              .build(*impl_->engine);
+
+  auto *pos_copy = new std::vector<filament::math::float3>(
+      std::move(positions));
+  impl_->shared_grid_vb->setBufferAt(
+      *impl_->engine,
+      0,
+      filament::VertexBuffer::BufferDescriptor(
+          pos_copy->data(),
+          pos_copy->size() * sizeof(filament::math::float3),
+          [](void * /*b*/, size_t /*s*/, void *u)
+          { delete static_cast<std::vector<filament::math::float3> *>(u); },
+          pos_copy));
+
+  auto *tan_copy = new std::vector<filament::math::quatf>(std::move(tangents));
+  impl_->shared_grid_vb->setBufferAt(
+      *impl_->engine,
+      1,
+      filament::VertexBuffer::BufferDescriptor(
+          tan_copy->data(),
+          tan_copy->size() * sizeof(filament::math::quatf),
+          [](void * /*b*/, size_t /*s*/, void *u)
+          { delete static_cast<std::vector<filament::math::quatf> *>(u); },
+          tan_copy));
+
+  // Solid triangle index buffer
+  impl_->solid_index_count = static_cast<uint32_t>(grid.indices.size());
+  impl_->shared_solid_ib = filament::IndexBuffer::Builder()
+                               .indexCount(impl_->solid_index_count)
+                               .bufferType(
+                                   filament::IndexBuffer::IndexType::UINT)
+                               .build(*impl_->engine);
+
+  auto *solid_copy = new std::vector<uint32_t>(grid.indices);
+  impl_->shared_solid_ib->setBuffer(
+      *impl_->engine,
+      filament::IndexBuffer::BufferDescriptor(
+          solid_copy->data(),
+          solid_copy->size() * sizeof(uint32_t),
+          [](void * /*b*/, size_t /*s*/, void *u)
+          { delete static_cast<std::vector<uint32_t> *>(u); },
+          solid_copy));
+
+  // Wireframe line index buffer
+  const size_t          quads_per_side = grid_res_ - 1;
+  std::vector<uint32_t> wire_indices;
+  wire_indices.reserve(quads_per_side * quads_per_side * 6);
+
+  for (size_t y = 0; y < quads_per_side; ++y)
+  {
+    for (size_t x = 0; x < quads_per_side; ++x)
+    {
+      const uint32_t i0 = static_cast<uint32_t>(y * grid_res_ + x);
+      const uint32_t i1 = static_cast<uint32_t>(y * grid_res_ + (x + 1));
+      const uint32_t i2 = static_cast<uint32_t>((y + 1) * grid_res_ + x);
+      const uint32_t i3 = static_cast<uint32_t>((y + 1) * grid_res_ + (x + 1));
+
+      wire_indices.push_back(i0);
+      wire_indices.push_back(i1);
+      wire_indices.push_back(i0);
+      wire_indices.push_back(i2);
+      wire_indices.push_back(i1);
+      wire_indices.push_back(i2);
+
+      if (x == quads_per_side - 1)
+      {
+        wire_indices.push_back(i1);
+        wire_indices.push_back(i3);
+      }
+
+      if (y == quads_per_side - 1)
+      {
+        wire_indices.push_back(i2);
+        wire_indices.push_back(i3);
+      }
+    }
+  }
+
+  impl_->wire_index_count = static_cast<uint32_t>(wire_indices.size());
+  impl_->shared_wire_ib = filament::IndexBuffer::Builder()
+                              .indexCount(impl_->wire_index_count)
+                              .bufferType(
+                                  filament::IndexBuffer::IndexType::UINT)
+                              .build(*impl_->engine);
+
+  auto *wire_copy = new std::vector<uint32_t>(std::move(wire_indices));
+  impl_->shared_wire_ib->setBuffer(
+      *impl_->engine,
+      filament::IndexBuffer::BufferDescriptor(
+          wire_copy->data(),
+          wire_copy->size() * sizeof(uint32_t),
+          [](void * /*b*/, size_t /*s*/, void *u)
+          { delete static_cast<std::vector<uint32_t> *>(u); },
+          wire_copy));
+}
+
+void ViewportWidget::update_sky_dome()
+{
+  if (!filament_initialized_ || !impl_->engine || !impl_->sky_mat_instance)
+  {
+    return;
+  }
+
+  const bool show_atmosphere = env_settings_.pbr_enabled &&
+                               env_settings_.atmospheric_scattering_enabled;
+
+  if (show_atmosphere)
+  {
+    const QVector3D     eye = get_camera_pos();
+    const terrain::Vec3 sun_ray = scene::compute_sun_direction(
+        sun_settings_.azimuth_deg,
+        sun_settings_.elevation_deg);
+    const terrain::Vec3 sun_to_sky{-sun_ray.x, -sun_ray.y, -sun_ray.z};
+
+    const terrain::Vec3 sun_col = sun_settings_.auto_color_temperature
+                                      ? scene::compute_sun_color_from_elevation(
+                                            sun_settings_.elevation_deg)
+                                      : sun_settings_.base_color;
+
+    impl_->sky_mat_instance->setParameter(
+        "cameraPos",
+        filament::math::float3(eye.x(), eye.y(), eye.z()));
+    impl_->sky_mat_instance->setParameter(
+        "sunDirToSky",
+        filament::math::float3(sun_to_sky.x, sun_to_sky.y, sun_to_sky.z));
+    impl_->sky_mat_instance->setParameter(
+        "sunColor",
+        filament::math::float3(sun_col.x, sun_col.y, sun_col.z));
+    impl_->sky_mat_instance->setParameter("rayleighStrength",
+                                          env_settings_.rayleigh_strength);
+    impl_->sky_mat_instance->setParameter("mieStrength",
+                                          env_settings_.mie_strength);
+    impl_->sky_mat_instance->setParameter(
+        "sunDiskAngularRadius",
+        sun_settings_.sun_angular_radius_deg *
+            (std::numbers::pi_v<float> / 180.0f) * 3.0f);
+    impl_->sky_mat_instance->setParameter("renderSunDisk",
+                                          sun_settings_.render_sun_disk);
+
+    if (!impl_->sky_dome_in_scene)
+    {
+      impl_->scene->addEntity(impl_->sky_dome_entity);
+      impl_->sky_dome_in_scene = true;
+    }
+  }
+  else
+  {
+    if (impl_->sky_dome_in_scene)
+    {
+      impl_->scene->remove(impl_->sky_dome_entity);
+      impl_->sky_dome_in_scene = false;
+    }
+  }
+}
+
+void ViewportWidget::update_terrain_renderables()
+{
+  if (!filament_initialized_ || !impl_->engine || !impl_->shared_grid_vb)
+  {
+    return;
+  }
+
+  filament::TextureSampler linear_sampler(
+      filament::TextureSampler::MinFilter::LINEAR,
+      filament::TextureSampler::MagFilter::LINEAR,
+      filament::TextureSampler::WrapMode::CLAMP_TO_EDGE);
+
+  // 1. Ensure GPU textures are uploaded for each terrain
+  for (auto &[id, entry] : impl_->terrains)
+  {
+    if (!entry.textures_dirty || !entry.descriptor.heightmap)
+    {
+      continue;
+    }
+
+    impl_->destroy_terrain_textures(entry);
+
+    const auto  &hdata = *entry.descriptor.heightmap;
+    const size_t w = hdata.get_width();
+    const size_t h = hdata.get_height();
+
+    entry.heightmap_tex = filament::Texture::Builder()
+                              .width(static_cast<uint32_t>(w))
+                              .height(static_cast<uint32_t>(h))
+                              .levels(1)
+                              .sampler(filament::Texture::Sampler::SAMPLER_2D)
+                              .format(filament::Texture::InternalFormat::R32F)
+                              .build(*impl_->engine);
+
+    auto *h_copy = new std::vector<float>(hdata.get_data());
+    filament::Texture::PixelBufferDescriptor h_buf(
+        h_copy->data(),
+        h_copy->size() * sizeof(float),
+        filament::Texture::Format::R,
+        filament::Texture::Type::FLOAT,
+        [](void * /*b*/, size_t /*s*/, void *u)
+        { delete static_cast<std::vector<float> *>(u); },
+        h_copy);
+    entry.heightmap_tex->setImage(*impl_->engine, 0, std::move(h_buf));
+
+    if (!entry.descriptor.normal_map_rgb8.empty())
+    {
+      entry.normal_tex = filament::Texture::Builder()
+                             .width(static_cast<uint32_t>(w))
+                             .height(static_cast<uint32_t>(h))
+                             .levels(1)
+                             .sampler(filament::Texture::Sampler::SAMPLER_2D)
+                             .format(filament::Texture::InternalFormat::RGB8)
+                             .build(*impl_->engine);
+
+      auto *n_copy = new std::vector<uint8_t>(entry.descriptor.normal_map_rgb8);
+      filament::Texture::PixelBufferDescriptor n_buf(
+          n_copy->data(),
+          n_copy->size(),
+          filament::Texture::Format::RGB,
+          filament::Texture::Type::UBYTE,
+          [](void * /*b*/, size_t /*s*/, void *u)
+          { delete static_cast<std::vector<uint8_t> *>(u); },
+          n_copy);
+      entry.normal_tex->setImage(*impl_->engine, 0, std::move(n_buf));
+    }
+
+    if (!entry.descriptor.albedo_map_rgb8.empty())
+    {
+      const size_t tex_w = (entry.descriptor.texture_width > 0)
+                               ? entry.descriptor.texture_width
+                               : w;
+      const size_t tex_h = (entry.descriptor.texture_height > 0)
+                               ? entry.descriptor.texture_height
+                               : h;
+
+      entry.albedo_tex = filament::Texture::Builder()
+                             .width(static_cast<uint32_t>(tex_w))
+                             .height(static_cast<uint32_t>(tex_h))
+                             .levels(1)
+                             .sampler(filament::Texture::Sampler::SAMPLER_2D)
+                             .format(filament::Texture::InternalFormat::RGB8)
+                             .build(*impl_->engine);
+
+      auto *a_copy = new std::vector<uint8_t>(entry.descriptor.albedo_map_rgb8);
+      filament::Texture::PixelBufferDescriptor a_buf(
+          a_copy->data(),
+          a_copy->size(),
+          filament::Texture::Format::RGB,
+          filament::Texture::Type::UBYTE,
+          [](void * /*b*/, size_t /*s*/, void *u)
+          { delete static_cast<std::vector<uint8_t> *>(u); },
+          a_copy);
+      entry.albedo_tex->setImage(*impl_->engine, 0, std::move(a_buf));
+    }
+
+    entry.textures_dirty = false;
+  }
+
+  // 2. Count total active CDLOD instances across all terrains
+  size_t total_instances = 0;
+  for (const auto &[id, entry] : impl_->terrains)
+  {
+    total_instances += entry.lod_instances.size();
+  }
+
+  const QVector3D              eye = get_camera_pos();
+  const filament::math::float3 cam_pos(eye.x(), eye.y(), eye.z());
+  const bool             use_lit = shading_enabled_ && !wireframe_enabled_;
+  filament::IndexBuffer *active_ib = wireframe_enabled_
+                                         ? impl_->shared_wire_ib
+                                         : impl_->shared_solid_ib;
+  const uint32_t         active_idx_count = wireframe_enabled_
+                                                ? impl_->wire_index_count
+                                                : impl_->solid_index_count;
+  const filament::RenderableManager::PrimitiveType prim_type =
+      wireframe_enabled_
+          ? filament::RenderableManager::PrimitiveType::LINES
+          : filament::RenderableManager::PrimitiveType::TRIANGLES;
+
+  auto &rm = impl_->engine->getRenderableManager();
+
+  // Expand pool if needed
+  if (impl_->terrain_node_pool.size() < total_instances)
+  {
+    const size_t prev_size = impl_->terrain_node_pool.size();
+    impl_->terrain_node_pool.resize(total_instances);
+
+    for (size_t i = prev_size; i < total_instances; ++i)
+    {
+      auto &node = impl_->terrain_node_pool[i];
+      node.entity = utils::EntityManager::get().create();
+      node.unlit_instance = impl_->terrain_unlit_mat->createInstance();
+      node.lit_instance = impl_->terrain_lit_mat->createInstance();
+      node.in_scene = false;
+
+      filament::RenderableManager::Builder(1)
+          .boundingBox(
+              {{-10000.0f, -10000.0f, -2000.0f}, {10000.0f, 10000.0f, 2000.0f}})
+          .material(0, use_lit ? node.lit_instance : node.unlit_instance)
+          .geometry(0,
+                    prim_type,
+                    impl_->shared_grid_vb,
+                    active_ib,
+                    0,
+                    active_idx_count)
+          .castShadows(true)
+          .receiveShadows(true)
+          .culling(false)
+          .build(*impl_->engine, node.entity);
+    }
+  }
+
+  // 3. Populate pooled nodes for each terrain's CDLOD instances
+  size_t pool_idx = 0;
+  for (const auto &[id, entry] : impl_->terrains)
+  {
+    if (!entry.patch || !entry.heightmap_tex)
+    {
+      continue;
+    }
+
+    const auto &desc = entry.descriptor;
+    const float rad = desc.rotation_deg * (std::numbers::pi_v<float> / 180.0f);
+    const float cos_t = std::cos(rad);
+    const float sin_t = std::sin(rad);
+
+    for (const auto &inst : entry.lod_instances)
+    {
+      auto &node = impl_->terrain_node_pool[pool_idx++];
+
+      auto ri = rm.getInstance(node.entity);
+      if (ri)
+      {
+        rm.setMaterialInstanceAt(ri,
+                                 0,
+                                 use_lit ? node.lit_instance
+                                         : node.unlit_instance);
+        rm.setGeometryAt(ri,
+                         0,
+                         prim_type,
+                         impl_->shared_grid_vb,
+                         active_ib,
+                         0,
+                         active_idx_count);
+
+        const terrain::AABB node_aabb = entry.patch
+                                            ->compute_subregion_world_aabb(
+                                                inst.offset_u,
+                                                inst.offset_v,
+                                                inst.offset_u + inst.scale_u,
+                                                inst.offset_v + inst.scale_v,
+                                                -10.0f,
+                                                desc.height_scale * 1.25f);
+
+        filament::Box box;
+        box.set({node_aabb.min.x, node_aabb.min.y, node_aabb.min.z},
+                {node_aabb.max.x, node_aabb.max.y, node_aabb.max.z});
+        rm.setAxisAlignedBoundingBox(ri, box);
+      }
+
+      filament::MaterialInstance *mi = use_lit ? node.lit_instance
+                                               : node.unlit_instance;
+
+      mi->setParameter("cameraPos", cam_pos);
+      mi->setParameter("patchOffsetScale",
+                       filament::math::float4(inst.offset_u,
+                                              inst.offset_v,
+                                              inst.scale_u,
+                                              inst.scale_v));
+      mi->setParameter(
+          "patchMorphLod",
+          filament::math::float4(inst.morph_start,
+                                 inst.morph_range,
+                                 static_cast<float>(inst.lod_level),
+                                 0.0f));
+      mi->setParameter(
+          "patchCenter",
+          filament::math::float3(desc.center.x, desc.center.y, desc.center.z));
+      mi->setParameter("patchSize", filament::math::float2(desc.lx, desc.ly));
+      mi->setParameter("patchCosSin", filament::math::float2(cos_t, sin_t));
+      mi->setParameter("heightScale", desc.height_scale);
+      mi->setParameter("gridDim", static_cast<float>(grid_res_));
+      mi->setParameter("morphEnabled", morphing_enabled_);
+      mi->setParameter("heightmap", entry.heightmap_tex, linear_sampler);
+
+      if (use_lit)
+      {
+        mi->setParameter("useLodColors", lod_color_debug_);
+        mi->setParameter("useAlbedoTexture", entry.albedo_tex != nullptr);
+        mi->setParameter("normalMap",
+                         entry.normal_tex ? entry.normal_tex
+                                          : impl_->fallback_white_tex,
+                         linear_sampler);
+        mi->setParameter("albedoMap",
+                         entry.albedo_tex ? entry.albedo_tex
+                                          : impl_->fallback_white_tex,
+                         linear_sampler);
+      }
+
+      if (!node.in_scene)
+      {
+        impl_->scene->addEntity(node.entity);
+        node.in_scene = true;
+      }
+    }
+  }
+
+  // Hide unused pooled nodes
+  for (size_t i = pool_idx; i < impl_->terrain_node_pool.size(); ++i)
+  {
+    auto &node = impl_->terrain_node_pool[i];
+    if (node.in_scene)
+    {
+      impl_->scene->remove(node.entity);
+      node.in_scene = false;
+    }
+  }
+
+  impl_->active_cdlod_nodes = pool_idx;
 }
 
 } // namespace oros::ui

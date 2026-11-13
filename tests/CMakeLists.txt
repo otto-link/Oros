@@ -21,8 +21,8 @@ endif()
 # --- UI manual test
 
 if(OROS_BUILD_UI_TESTS)
-  add_subdirectory(ui_test)
   add_subdirectory(ui_cdlod_test)
   add_subdirectory(ui_cdlod_gl_test)
   add_subdirectory(ui_cdlod_filament_test)
+  add_subdirectory(ui_test)
 endif()

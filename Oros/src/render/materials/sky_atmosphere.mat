@@ -1,0 +1,109 @@
+material {
+    name : sky_atmosphere,
+    shadingModel : unlit,
+    culling : none,
+    doubleSided : true,
+    depthWrite : false,
+    vertexDomain : world,
+    parameters : [
+        {
+            type : float3,
+            name : cameraPos
+        },
+        {
+            type : float3,
+            name : sunDirToSky
+        },
+        {
+            type : float3,
+            name : sunColor
+        },
+        {
+            type : float,
+            name : rayleighStrength
+        },
+        {
+            type : float,
+            name : mieStrength
+        },
+        {
+            type : float,
+            name : sunDiskAngularRadius
+        },
+        {
+            type : bool,
+            name : renderSunDisk
+        }
+    ],
+    variables : [
+        vViewDir
+    ],
+    requires : [
+        position
+    ]
+}
+
+vertex {
+    void materialVertex(inout MaterialVertexInputs material) {
+        // getPosition().xyz is the sphere vertex centered around the origin.
+        // Offset by cameraPos in world space so the sky dome always surrounds the camera.
+        vec3 dir = getPosition().xyz;
+        material.vViewDir = vec4(dir, 0.0);
+        material.worldPosition = vec4(materialParams.cameraPos + dir, 1.0) - vec4(getWorldOffset(), 0.0);
+    }
+}
+
+fragment {
+    void material(inout MaterialInputs material) {
+        prepareMaterial(material);
+
+        // View direction from camera to sky pixel
+        vec3 viewDir = normalize(variable_vViewDir.xyz);
+        vec3 sunDir = normalize(materialParams.sunDirToSky);
+
+        float sunElevation = sunDir.z;
+        float dayFactor = clamp((sunElevation + 0.12) / 0.65, 0.0, 1.0);
+        float sunsetFactor = clamp(1.0 - abs(sunElevation - 0.06) * 4.5, 0.0, 1.0);
+
+        // Zenith and horizon Rayleigh base colors
+        vec3 zenithDay = vec3(0.08, 0.24, 0.62) * materialParams.rayleighStrength;
+        vec3 zenithSunset = vec3(0.10, 0.14, 0.34) * materialParams.rayleighStrength;
+        vec3 zenithNight = vec3(0.015, 0.02, 0.05);
+
+        vec3 horizonDay = vec3(0.45, 0.68, 0.92);
+        vec3 horizonSunset = vec3(0.95, 0.42, 0.16);
+        vec3 horizonNight = vec3(0.03, 0.04, 0.08);
+
+        vec3 zenithCol = mix(zenithNight, mix(zenithSunset, zenithDay, dayFactor), clamp(dayFactor + sunsetFactor * 0.5, 0.0, 1.0));
+        vec3 horizonCol = mix(horizonNight, mix(horizonDay, horizonSunset, sunsetFactor * 0.85), clamp(dayFactor + sunsetFactor * 0.7, 0.0, 1.0));
+
+        float upDot = clamp(viewDir.z, 0.0, 1.0);
+        float horizonBlend = pow(max(1.0 - upDot, 1e-4), 2.6);
+        vec3 skyColor = mix(zenithCol, horizonCol, horizonBlend);
+
+        // Ground hemisphere below horizon
+        if (viewDir.z < 0.0) {
+            float downBlend = clamp(-viewDir.z * 4.0, 0.0, 1.0);
+            vec3 groundHaze = horizonCol * 0.45;
+            skyColor = mix(horizonCol, groundHaze, downBlend);
+        }
+
+        // Mie forward scattering (Henyey-Greenstein phase approximation)
+        float cosTheta = dot(viewDir, sunDir);
+        float g = 0.76;
+        float g2 = g * g;
+        float miePhase = (1.0 - g2) / (4.0 * 3.14159265 * pow(max(0.01, 1.0 + g2 - 2.0 * g * cosTheta), 1.5));
+        vec3 mieScattering = materialParams.sunColor * miePhase * 0.18 * materialParams.mieStrength * clamp(sunElevation + 0.2, 0.0, 1.0);
+        skyColor += mieScattering;
+
+        // Solar disk and corona
+        if (materialParams.renderSunDisk && sunElevation > -0.08 && cosTheta > 0.0) {
+            float cosRadius = cos(materialParams.sunDiskAngularRadius);
+            float diskEdge = smoothstep(cosRadius - 0.0004, cosRadius + 0.0001, cosTheta);
+            float corona = pow(max(cosTheta, 1e-4), 256.0) * 1.5;
+            skyColor += materialParams.sunColor * (diskEdge * 12.0 + corona);
+        }
+
+        material.baseColor = vec4(skyColor, 1.0);
+    }
+}

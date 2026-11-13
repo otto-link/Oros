@@ -142,11 +142,21 @@ AABB HeightmapPatch::compute_world_aabb() const
     max_z = range.second;
   }
 
-  // 4 corners of the patch in local coordinates
-  const Vec3 c0 = local_to_world(0.0f, 0.0f, min_z);
-  const Vec3 c1 = local_to_world(1.0f, 0.0f, min_z);
-  const Vec3 c2 = local_to_world(0.0f, 1.0f, min_z);
-  const Vec3 c3 = local_to_world(1.0f, 1.0f, min_z);
+  return compute_subregion_world_aabb(0.0f, 0.0f, 1.0f, 1.0f, min_z, max_z);
+}
+
+AABB HeightmapPatch::compute_subregion_world_aabb(float u0,
+                                                  float v0,
+                                                  float u1,
+                                                  float v1,
+                                                  float min_z,
+                                                  float max_z) const
+{
+  // 4 corners of the sub-region in local coordinates
+  const Vec3 c0 = local_to_world(u0, v0, min_z);
+  const Vec3 c1 = local_to_world(u1, v0, min_z);
+  const Vec3 c2 = local_to_world(u0, v1, min_z);
+  const Vec3 c3 = local_to_world(u1, v1, min_z);
 
   const float aabb_min_x = std::min({c0.x, c1.x, c2.x, c3.x});
   const float aabb_max_x = std::max({c0.x, c1.x, c2.x, c3.x});
@@ -156,6 +166,42 @@ AABB HeightmapPatch::compute_world_aabb() const
 
   return {{aabb_min_x, aabb_min_y, center_.z + min_z},
           {aabb_max_x, aabb_max_y, center_.z + max_z}};
+}
+
+float HeightmapPatch::sample_elevation(float u, float v) const
+{
+  if (!heightmap_data_ || heightmap_data_->get_width() == 0 ||
+      heightmap_data_->get_height() == 0)
+  {
+    return 0.0f;
+  }
+
+  const float clamped_u = std::clamp(u, 0.0f, 1.0f);
+  const float clamped_v = std::clamp(v, 0.0f, 1.0f);
+
+  const size_t w = heightmap_data_->get_width();
+  const size_t h = heightmap_data_->get_height();
+
+  const float fx = clamped_u * static_cast<float>(w > 1 ? w - 1 : 0);
+  const float fy = clamped_v * static_cast<float>(h > 1 ? h - 1 : 0);
+
+  const size_t x0 = static_cast<size_t>(std::floor(fx));
+  const size_t y0 = static_cast<size_t>(std::floor(fy));
+  const size_t x1 = std::min(x0 + 1, w - 1);
+  const size_t y1 = std::min(y0 + 1, h - 1);
+
+  const float tx = fx - static_cast<float>(x0);
+  const float ty = fy - static_cast<float>(y0);
+
+  const float z00 = heightmap_data_->get_height_at(x0, y0);
+  const float z10 = heightmap_data_->get_height_at(x1, y0);
+  const float z01 = heightmap_data_->get_height_at(x0, y1);
+  const float z11 = heightmap_data_->get_height_at(x1, y1);
+
+  const float z0 = z00 + tx * (z10 - z00);
+  const float z1 = z01 + tx * (z11 - z01);
+
+  return z0 + ty * (z1 - z0);
 }
 
 } // namespace oros::terrain

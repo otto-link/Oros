@@ -6,6 +6,7 @@
 #include <numeric>
 #include <vector>
 
+#include "oros/scene/scene_types.hpp"
 #include "oros/terrain/async_lod_selector.hpp"
 #include "oros/terrain/cdlod_quadtree.hpp"
 #include "oros/terrain/grid_mesh_factory.hpp"
@@ -15,6 +16,7 @@
 #include <gtest/gtest.h>
 
 using namespace oros::terrain;
+using namespace oros::scene;
 
 // --- HeightmapData tests
 
@@ -143,6 +145,14 @@ TEST(TerrainGridMeshFactoryTest, GenerateUnitGrid)
   EXPECT_FLOAT_EQ(mesh.vertices.front().v, 0.0f);
   EXPECT_FLOAT_EQ(mesh.vertices.back().u, 1.0f);
   EXPECT_FLOAT_EQ(mesh.vertices.back().v, 1.0f);
+
+  // Verify CCW winding in XY plane so geometric normal points in +Z (upward)
+  const auto &v0 = mesh.vertices[mesh.indices[0]];
+  const auto &v1 = mesh.vertices[mesh.indices[1]];
+  const auto &v2 = mesh.vertices[mesh.indices[2]];
+  const float cross_z = (v1.u - v0.u) * (v2.v - v0.v) -
+                        (v1.v - v0.v) * (v2.u - v0.u);
+  EXPECT_GT(cross_z, 0.0f);
 }
 
 // --- CDLODQuadTree & AsyncLODSelector tests
@@ -199,4 +209,59 @@ TEST(TerrainAsyncLODTest, AsyncSelection)
   const auto instances = future_instances.get();
 
   EXPECT_FALSE(instances.empty());
+}
+
+TEST(TerrainHeightmapPatchTest, RotatedSubregionAABBAndSampleElevation)
+{
+  auto hdata = std::make_shared<HeightmapData>(4, 4, 0.0f);
+  hdata->set_height_at(3, 3, 1.0f);
+
+  // 45 degree rotated patch of size 100x100
+  HeightmapPatch patch("patch_rot",
+                       hdata,
+                       {0.0f, 0.0f, 0.0f},
+                       100.0f,
+                       100.0f,
+                       45.0f);
+
+  const AABB full_aabb = patch.compute_world_aabb();
+  // Diagonal half-extent of 100x100 square rotated by 45 deg is 50 * sqrt(2) ~=
+  // 70.710678
+  EXPECT_NEAR(full_aabb.min.x, -70.710678f, 1e-3f);
+  EXPECT_NEAR(full_aabb.max.x, 70.710678f, 1e-3f);
+  EXPECT_NEAR(full_aabb.min.y, -70.710678f, 1e-3f);
+  EXPECT_NEAR(full_aabb.max.y, 70.710678f, 1e-3f);
+
+  EXPECT_FLOAT_EQ(patch.sample_elevation(0.0f, 0.0f), 0.0f);
+  EXPECT_FLOAT_EQ(patch.sample_elevation(1.0f, 1.0f), 1.0f);
+}
+
+TEST(SceneTypesTest, ScatterMeshesAndSunPhysics)
+{
+  const auto rock = ScatterMeshFactory::create_rock_mesh(2.0f, 2, 42);
+  EXPECT_FALSE(rock.positions.empty());
+  EXPECT_EQ(rock.positions.size(), rock.normals.size());
+  EXPECT_EQ(rock.indices.size() % 3, 0u);
+
+  const auto pine = ScatterMeshFactory::create_pine_tree_mesh(3.0f, 12.0f);
+  EXPECT_FALSE(pine.positions.empty());
+  EXPECT_EQ(pine.positions.size(), pine.normals.size());
+  EXPECT_EQ(pine.indices.size() % 3, 0u);
+
+  const auto decid = ScatterMeshFactory::create_deciduous_tree_mesh(3.5f,
+                                                                    10.0f);
+  EXPECT_FALSE(decid.positions.empty());
+  EXPECT_EQ(decid.positions.size(), decid.normals.size());
+  EXPECT_EQ(decid.indices.size() % 3, 0u);
+
+  // Sun at zenith (elevation = 90 deg) points straight down (0, 0, -1)
+  const Vec3 zenith_dir = compute_sun_direction(0.0f, 90.0f);
+  EXPECT_NEAR(zenith_dir.x, 0.0f, 1e-4f);
+  EXPECT_NEAR(zenith_dir.y, 0.0f, 1e-4f);
+  EXPECT_NEAR(zenith_dir.z, -1.0f, 1e-4f);
+
+  const Vec3 sunset_col = compute_sun_color_from_elevation(2.0f);
+  const Vec3 noon_col = compute_sun_color_from_elevation(75.0f);
+  // Sunset has warmer (lower blue/green relative to red) color than noon
+  EXPECT_LT(sunset_col.z, noon_col.z);
 }

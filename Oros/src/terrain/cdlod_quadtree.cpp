@@ -62,18 +62,22 @@ void CDLODQuadTree::select_node(const HeightmapPatch        &patch,
                                 const CDLODNode             &node,
                                 std::vector<CDLODInstance> &out_instances) const
 {
-  // Compute node world-space Axis-Aligned Bounding Box (AABB)
-  const Vec3 c_min = patch.local_to_world(node.u0, node.v0, node.min_z);
-  const Vec3 c_max = patch.local_to_world(node.u0 + node.size_u,
-                                          node.v0 + node.size_v,
-                                          node.max_z);
+  // Compute conservative node world-space Axis-Aligned Bounding Box (AABB)
+  // across all 4 corners to handle rotated patches properly
+  const AABB node_aabb = patch.compute_subregion_world_aabb(
+      node.u0,
+      node.v0,
+      node.u0 + node.size_u,
+      node.v0 + node.size_v,
+      node.min_z,
+      node.max_z);
 
-  const float aabb_min_x = std::min(c_min.x, c_max.x);
-  const float aabb_max_x = std::max(c_min.x, c_max.x);
-  const float aabb_min_y = std::min(c_min.y, c_max.y);
-  const float aabb_max_y = std::max(c_min.y, c_max.y);
-  const float aabb_min_z = std::min(c_min.z, c_max.z);
-  const float aabb_max_z = std::max(c_min.z, c_max.z);
+  const float aabb_min_x = node_aabb.min.x;
+  const float aabb_max_x = node_aabb.max.x;
+  const float aabb_min_y = node_aabb.min.y;
+  const float aabb_max_y = node_aabb.max.y;
+  const float aabb_min_z = node_aabb.min.z;
+  const float aabb_max_z = node_aabb.max.z;
 
   // Minimum distance from camera to the node's AABB
   float aabb_dist_sq = 0.0f;

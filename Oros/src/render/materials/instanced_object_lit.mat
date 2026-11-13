@@ -1,0 +1,83 @@
+material {
+    name : instanced_object_lit,
+    shadingModel : lit,
+    culling : back,
+    instanced : true,
+    vertexDomain : world,
+    parameters : [
+        {
+            type : sampler2d,
+            name : instanceDataMap
+        },
+        {
+            type : int,
+            name : instanceTexWidth
+        },
+        {
+            type : float3,
+            name : baseColorTint
+        },
+        {
+            type : float,
+            name : roughness
+        },
+        {
+            type : float,
+            name : metallic
+        }
+    ],
+    variables : [
+        vRotatedNormal
+    ],
+    requires : [
+        position,
+        color,
+        tangents
+    ]
+}
+
+vertex {
+    void materialVertex(inout MaterialVertexInputs material) {
+        int idx = getInstanceIndex();
+        int texW = max(1, materialParams.instanceTexWidth);
+        int tx = idx % texW;
+        int ty = idx / texW;
+
+        vec4 instPosScale = texelFetch(materialParams_instanceDataMap, ivec2(tx * 2, ty), 0);
+        vec4 instRot      = texelFetch(materialParams_instanceDataMap, ivec2(tx * 2 + 1, ty), 0);
+
+        vec3 instancePos = instPosScale.xyz;
+        float scale = instPosScale.w;
+        float cosYaw = instRot.x;
+        float sinYaw = instRot.y;
+
+        vec3 localPos = getPosition().xyz * scale;
+        vec3 rotatedPos = vec3(
+            cosYaw * localPos.x - sinYaw * localPos.y,
+            sinYaw * localPos.x + cosYaw * localPos.y,
+            localPos.z
+        );
+
+        vec3 finalWorldPos = instancePos + rotatedPos;
+        material.worldPosition = vec4(finalWorldPos, 1.0) - vec4(getWorldOffset(), 0.0);
+
+        vec3 localN = material.worldNormal;
+        vec3 rotatedN = normalize(vec3(
+            cosYaw * localN.x - sinYaw * localN.y,
+            sinYaw * localN.x + cosYaw * localN.y,
+            localN.z
+        ));
+        material.worldNormal = rotatedN;
+        material.vRotatedNormal = vec4(rotatedN, 0.0);
+    }
+}
+
+fragment {
+    void material(inout MaterialInputs material) {
+        material.normal = normalize(variable_vRotatedNormal.xyz);
+        prepareMaterial(material);
+        material.baseColor = vec4(getColor().rgb * materialParams.baseColorTint, 1.0);
+        material.roughness = materialParams.roughness;
+        material.metallic = materialParams.metallic;
+    }
+}

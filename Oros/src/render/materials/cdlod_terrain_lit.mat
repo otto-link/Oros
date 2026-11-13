@@ -1,0 +1,187 @@
+material {
+    name : cdlod_terrain_lit,
+    shadingModel : lit,
+    culling : none,
+    doubleSided : true,
+    vertexDomain : world,
+    parameters : [
+        {
+            type : sampler2d,
+            name : heightmap
+        },
+        {
+            type : sampler2d,
+            name : normalMap
+        },
+        {
+            type : sampler2d,
+            name : albedoMap
+        },
+        {
+            type : float3,
+            name : cameraPos
+        },
+        {
+            type : float4,
+            name : patchOffsetScale
+        },
+        {
+            type : float4,
+            name : patchMorphLod
+        },
+        {
+            type : float3,
+            name : patchCenter
+        },
+        {
+            type : float2,
+            name : patchSize
+        },
+        {
+            type : float2,
+            name : patchCosSin
+        },
+        {
+            type : float,
+            name : heightScale
+        },
+        {
+            type : float,
+            name : gridDim
+        },
+        {
+            type : bool,
+            name : morphEnabled
+        },
+        {
+            type : bool,
+            name : useLodColors
+        },
+        {
+            type : bool,
+            name : useAlbedoTexture
+        }
+    ],
+    variables : [
+        vLodColor,
+        vUv,
+        vSlopeHeight
+    ],
+    requires : [
+        position
+    ]
+}
+
+vertex {
+    vec3 getLodColor(int lod) {
+        if (lod == 0) return vec3(0.314, 0.980, 0.482); // Dracula Green  (#50fa7b)
+        if (lod == 1) return vec3(0.545, 0.914, 0.992); // Dracula Cyan   (#8be9fd)
+        if (lod == 2) return vec3(0.945, 0.980, 0.549); // Dracula Yellow (#f1fa8c)
+        if (lod == 3) return vec3(1.000, 0.722, 0.424); // Dracula Orange (#ffb86c)
+        if (lod == 4) return vec3(1.000, 0.475, 0.776); // Dracula Pink   (#ff79c6)
+        if (lod == 5) return vec3(0.741, 0.576, 0.976); // Dracula Purple (#bd93f9)
+        if (lod == 6) return vec3(1.000, 0.333, 0.333); // Dracula Red    (#ff5555)
+        return vec3(0.384, 0.447, 0.643);                // Dracula Comment(#6272a4)
+    }
+
+    vec2 rotateXy(vec2 localXy, vec2 cosSin) {
+        return vec2(
+            cosSin.x * localXy.x - cosSin.y * localXy.y,
+            cosSin.y * localXy.x + cosSin.x * localXy.y
+        );
+    }
+
+    void materialVertex(inout MaterialVertexInputs material) {
+        vec2 localPos = getPosition().xy;
+        vec2 patchOffset = materialParams.patchOffsetScale.xy;
+        vec2 patchScale  = materialParams.patchOffsetScale.zw;
+        float morphStart = materialParams.patchMorphLod.x;
+        float morphRange = materialParams.patchMorphLod.y;
+        float lodLevel   = materialParams.patchMorphLod.z;
+
+        vec2 uv = patchOffset + localPos * patchScale;
+        vec2 localXy = (uv - vec2(0.5)) * materialParams.patchSize;
+        vec2 rotatedXy = rotateXy(localXy, materialParams.patchCosSin);
+        vec3 worldPosInitial = vec3(
+            materialParams.patchCenter.x + rotatedXy.x,
+            materialParams.patchCenter.y + rotatedXy.y,
+            materialParams.patchCenter.z + texture(materialParams_heightmap, uv).r * materialParams.heightScale
+        );
+
+        float dist = length(worldPosInitial - materialParams.cameraPos);
+
+        float morphAlpha = 0.0;
+        if (materialParams.morphEnabled && morphRange > 0.001) {
+            morphAlpha = clamp((dist - morphStart) / morphRange, 0.0, 1.0);
+        }
+
+        float meshQuads = materialParams.gridDim - 1.0;
+        vec2 fracUv = fract(localPos * (meshQuads * 0.5)) / (meshQuads * 0.5);
+        vec2 uvCoarse = uv - fracUv * patchScale;
+
+        vec2 uvMorphed = mix(uv, uvCoarse, morphAlpha);
+        vec2 localXyMorphed = (uvMorphed - vec2(0.5)) * materialParams.patchSize;
+        vec2 rotatedXyMorphed = rotateXy(localXyMorphed, materialParams.patchCosSin);
+        float normHeight = texture(materialParams_heightmap, uvMorphed).r;
+        float height = normHeight * materialParams.heightScale;
+
+        vec3 finalWorldPos = vec3(
+            materialParams.patchCenter.x + rotatedXyMorphed.x,
+            materialParams.patchCenter.y + rotatedXyMorphed.y,
+            materialParams.patchCenter.z + height
+        );
+
+        material.worldPosition = vec4(finalWorldPos, 1.0) - vec4(getWorldOffset(), 0.0);
+        material.vLodColor = vec4(getLodColor(int(round(lodLevel))), 1.0);
+        material.vUv = vec4(uvMorphed, 0.0, 0.0);
+        material.vSlopeHeight = vec4(normHeight, height, 0.0, 0.0);
+    }
+}
+
+fragment {
+    void material(inout MaterialInputs material) {
+        vec3 nLocal = normalize(texture(materialParams_normalMap, variable_vUv.xy).xyz * 2.0 - 1.0);
+
+        // Rotate normal XY by patch rotation angle so lighting matches rotated terrain
+        vec2 cosSin = materialParams.patchCosSin;
+        vec3 nWorld = normalize(vec3(
+            cosSin.x * nLocal.x - cosSin.y * nLocal.y,
+            cosSin.y * nLocal.x + cosSin.x * nLocal.y,
+            nLocal.z
+        ));
+
+        material.normal = nWorld;
+        prepareMaterial(material);
+
+        if (materialParams.useLodColors) {
+            material.baseColor = variable_vLodColor;
+            material.roughness = 0.65;
+            material.metallic = 0.0;
+        } else if (materialParams.useAlbedoTexture) {
+            vec4 texAlbedo = texture(materialParams_albedoMap, variable_vUv.xy);
+            material.baseColor = texAlbedo;
+            material.roughness = 0.78;
+            material.metallic = 0.0;
+        } else {
+            // Procedural elevation & slope-based PBR terrain biome coloring
+            float hNorm = clamp(variable_vSlopeHeight.x, 0.0, 1.0);
+            float slope = 1.0 - clamp(nWorld.z, 0.0, 1.0);
+
+            vec3 valleyGrass = vec3(0.16, 0.30, 0.11);
+            vec3 highlandMeadow = vec3(0.32, 0.36, 0.18);
+            vec3 cliffRock = vec3(0.34, 0.32, 0.30);
+            vec3 alpineSnow = vec3(0.86, 0.89, 0.93);
+
+            vec3 baseBiome = mix(valleyGrass, highlandMeadow, smoothstep(0.15, 0.55, hNorm));
+            float rockMask = smoothstep(0.22, 0.50, slope);
+            vec3 rockyTerrain = mix(baseBiome, cliffRock, rockMask);
+
+            float snowMask = smoothstep(0.65, 0.82, hNorm) * (1.0 - smoothstep(0.38, 0.62, slope));
+            vec3 finalColor = mix(rockyTerrain, alpineSnow, snowMask);
+
+            material.baseColor = vec4(finalColor, 1.0);
+            material.roughness = mix(0.85, 0.55, snowMask);
+            material.metallic = 0.0;
+        }
+    }
+}
