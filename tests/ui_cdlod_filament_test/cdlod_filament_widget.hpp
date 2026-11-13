@@ -73,12 +73,14 @@ public:
   void create_patch();
   void generate_noise();
   void regenerate_noise();
+  void set_ambient_occlusion_enabled(bool enabled);
   void set_grid_resolution(size_t resolution);
   void set_lod_distance_scale(float scale);
   void set_max_lod_levels(uint32_t levels);
   void set_morphing_enabled(bool enabled);
   void set_noise_frequency(float freq);
   void set_shading_mode(bool enabled);
+  void set_shadows_enabled(bool enabled);
   void set_wireframe_mode(bool enabled);
 
 signals:
@@ -113,15 +115,17 @@ private:
   void update_textures();
 
   // Terrain generation parameters
-  size_t heightmap_res_{16 * 512};
+  size_t heightmap_res_{1 * 512};
   size_t grid_res_{33};
   float  noise_frequency_{2.0f};
   float  world_size_{1000.0f};
   float  height_scale_{150.0f};
   float  lod_dist_scale_{1.0f};
+  bool   ao_enabled_{true};
   bool   morphing_enabled_{true};
-  bool   wireframe_mode_{true};
   bool   shading_enabled_{true};
+  bool   shadows_enabled_{true};
+  bool   wireframe_mode_{true};
 
   // Camera parameters (Orbit Camera)
   float     camera_yaw_{-45.0f};

@@ -24,6 +24,7 @@
 #include <filament/LightManager.h>
 #include <filament/Material.h>
 #include <filament/MaterialInstance.h>
+#include <filament/Options.h>
 #include <filament/RenderableManager.h>
 #include <filament/Renderer.h>
 #include <filament/Scene.h>
@@ -465,8 +466,16 @@ void CdlodFilamentWidget::init_filament()
     return;
   }
 
-  // Create Filament engine with OpenGL backend
-  engine_ = filament::Engine::create(filament::backend::Backend::OPENGL);
+  // Create Filament engine with OpenGL backend and expanded handle arena
+  filament::Engine::Config engine_config;
+  engine_config.driverHandleArenaSizeMB = 16;
+  engine_config.commandBufferSizeMB = 16;
+  engine_config.perRenderPassArenaSizeMB = 16;
+
+  engine_ = filament::Engine::Builder()
+                .backend(filament::backend::Backend::OPENGL)
+                .config(&engine_config)
+                .build();
   if (!engine_)
   {
     oros::Logger::log()->error("Failed to create Filament engine!");
@@ -488,8 +497,28 @@ void CdlodFilamentWidget::init_filament()
 
   // View configuration
   view_->setPostProcessingEnabled(true);
-  view_->setDithering(filament::Dithering::TEMPORAL);
-  view_->setShadowingEnabled(false);
+  view_->setDithering(filament::Dithering::NONE);
+  view_->setShadowingEnabled(shadows_enabled_);
+  view_->setShadowType(filament::ShadowType::PCF);
+
+  // Soft shadows configuration
+  filament::View::SoftShadowOptions soft_shadow_options;
+  soft_shadow_options.penumbraScale = 1.0f;
+  soft_shadow_options.penumbraRatioScale = 1.0f;
+  view_->setSoftShadowOptions(soft_shadow_options);
+
+  // Ambient occlusion configuration (GTAO)
+  filament::View::AmbientOcclusionOptions ao_options;
+  ao_options.enabled = ao_enabled_;
+  ao_options.aoType =
+      filament::View::AmbientOcclusionOptions::AmbientOcclusionType::GTAO;
+  ao_options.quality = filament::View::QualityLevel::HIGH;
+  ao_options.lowPassFilter = filament::View::QualityLevel::HIGH;
+  ao_options.upsampling = filament::View::QualityLevel::HIGH;
+  ao_options.bentNormals = true;
+  ao_options.gtao.sampleSliceCount = 8;
+  ao_options.gtao.sampleStepsPerSlice = 4;
+  view_->setAmbientOcclusionOptions(ao_options);
 
   // Background Skybox
   skybox_ = filament::Skybox::Builder()
@@ -504,14 +533,31 @@ void CdlodFilamentWidget::init_filament()
   view_->setScene(scene_);
   view_->setViewport(filament::Viewport(0, 0, width(), height()));
 
-  // Directional sun light
+  // Directional sun light with 4-cascade high-resolution soft shadows
   *sun_light_entity_ = utils::EntityManager::get().create();
+
+  filament::LightManager::ShadowOptions shadow_options;
+  shadow_options.mapSize = 4096;
+  shadow_options.shadowCascades = 4;
+  shadow_options.shadowNearHint = 10.0f;
+  shadow_options.shadowFar = 3000.0f;
+  shadow_options.shadowFarHint = 3000.0f;
+  shadow_options.screenSpaceContactShadows = false;
+
+  filament::LightManager::ShadowCascades::computePracticalSplits(
+      shadow_options.cascadeSplitPositions,
+      shadow_options.shadowCascades,
+      shadow_options.shadowNearHint,
+      shadow_options.shadowFar,
+      0.3f);
+
   filament::LightManager::Builder(filament::LightManager::Type::DIRECTIONAL)
       .color(
           filament::Color::toLinear<filament::ACCURATE>({1.0f, 0.98f, 0.92f}))
       .intensity(90000.0f)
       .direction(normalize(filament::math::float3(0.5f, 0.3f, 0.8f)))
-      .castShadows(false)
+      .castShadows(shadows_enabled_)
+      .shadowOptions(shadow_options)
       .build(*engine_, *sun_light_entity_);
   scene_->addEntity(*sun_light_entity_);
 
@@ -646,6 +692,18 @@ void CdlodFilamentWidget::resizeEvent(QResizeEvent *event)
   }
 }
 
+void CdlodFilamentWidget::set_ambient_occlusion_enabled(bool enabled)
+{
+  ao_enabled_ = enabled;
+  if (initialized_ && view_)
+  {
+    filament::View::AmbientOcclusionOptions ao_options =
+        view_->getAmbientOcclusionOptions();
+    ao_options.enabled = ao_enabled_;
+    view_->setAmbientOcclusionOptions(ao_options);
+  }
+}
+
 void CdlodFilamentWidget::set_grid_resolution(size_t resolution)
 {
   if (grid_res_ != resolution)
@@ -695,6 +753,28 @@ void CdlodFilamentWidget::set_shading_mode(bool enabled)
   }
 }
 
+void CdlodFilamentWidget::set_shadows_enabled(bool enabled)
+{
+  shadows_enabled_ = enabled;
+  if (initialized_)
+  {
+    if (view_)
+    {
+      view_->setShadowingEnabled(shadows_enabled_);
+    }
+
+    if (sun_light_entity_ && *sun_light_entity_ && engine_)
+    {
+      auto &lm = engine_->getLightManager();
+      auto  light_inst = lm.getInstance(*sun_light_entity_);
+      if (light_inst)
+      {
+        lm.setShadowCaster(light_inst, shadows_enabled_);
+      }
+    }
+  }
+}
+
 void CdlodFilamentWidget::set_wireframe_mode(bool enabled)
 {
   wireframe_mode_ = enabled;
@@ -727,8 +807,8 @@ void CdlodFilamentWidget::update_camera()
 
   camera_->setProjection(45.0,
                          aspect,
-                         1.0,
-                         5000.0,
+                         10.0,
+                         3000.0,
                          filament::Camera::Fov::VERTICAL);
   camera_->lookAt(filament::math::float3(eye.x(), eye.y(), eye.z()),
                   filament::math::float3(camera_target_.x(),
@@ -790,6 +870,9 @@ void CdlodFilamentWidget::update_patch_renderables()
                         {world_size_, world_size_, height_scale_ * 2.0f}})
           .material(0, use_lit ? node.lit_instance : node.unlit_instance)
           .geometry(0, prim_type, shared_vb_, active_ib, 0, active_index_count)
+          .castShadows(true)
+          .receiveShadows(true)
+          .screenSpaceContactShadows(false)
           .culling(false)
           .build(*engine_, node.entity);
     }

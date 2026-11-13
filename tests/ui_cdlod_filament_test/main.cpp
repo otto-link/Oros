@@ -76,6 +76,27 @@ int main(int argc, char *argv[])
                    filament_widget,
                    &oros::ui::CdlodFilamentWidget::set_shading_mode);
 
+  // Soft Shadows Checkbox
+  auto *shadows_check = new QCheckBox("Soft Shadows (PCF Cascades)", panel);
+  shadows_check->setChecked(true);
+  panel_layout->addWidget(shadows_check);
+
+  QObject::connect(shadows_check,
+                   &QCheckBox::toggled,
+                   filament_widget,
+                   &oros::ui::CdlodFilamentWidget::set_shadows_enabled);
+
+  // Ambient Occlusion Checkbox
+  auto *ao_check = new QCheckBox("Ambient Occlusion (GTAO)", panel);
+  ao_check->setChecked(true);
+  panel_layout->addWidget(ao_check);
+
+  QObject::connect(
+      ao_check,
+      &QCheckBox::toggled,
+      filament_widget,
+      &oros::ui::CdlodFilamentWidget::set_ambient_occlusion_enabled);
+
   // Wireframe Checkbox
   auto *wireframe_check = new QCheckBox("Wireframe Mode (Lines)", panel);
   wireframe_check->setChecked(true);
