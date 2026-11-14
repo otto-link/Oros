@@ -142,6 +142,12 @@ struct EnvironmentSettings
   float atmosphere_turbidity{2.5f};
   float rayleigh_strength{1.0f};
   float mie_strength{1.0f};
+
+  // Optional infinite ground plane
+  bool          ground_plane_enabled{false};
+  float         ground_plane_elevation{0.0f};
+  terrain::Vec3 ground_plane_color{0.20f, 0.24f, 0.16f};
+  float         ground_plane_roughness{0.88f};
 };
 
 } // namespace oros::scene

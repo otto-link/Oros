@@ -1,0 +1,73 @@
+material {
+    name : ground_plane_lit,
+    shadingModel : lit,
+    culling : none,
+    doubleSided : true,
+    vertexDomain : world,
+    parameters : [
+        {
+            type : float3,
+            name : cameraPos
+        },
+        {
+            type : float,
+            name : groundElevation
+        },
+        {
+            type : float3,
+            name : groundColor
+        },
+        {
+            type : float,
+            name : groundRoughness
+        }
+    ],
+    variables : [
+        vWorldXy
+    ],
+    requires : [
+        position,
+        tangents
+    ]
+}
+
+vertex {
+    void materialVertex(inout MaterialVertexInputs material) {
+        vec2 localPos = getPosition().xy;
+        vec2 worldXy = materialParams.cameraPos.xy + localPos;
+        vec3 finalWorldPos = vec3(worldXy.x, worldXy.y, materialParams.groundElevation);
+
+        material.worldPosition = vec4(finalWorldPos, 1.0) - vec4(getWorldOffset(), 0.0);
+        material.vWorldXy = vec4(worldXy, 0.0, 0.0);
+    }
+}
+
+fragment {
+    float gridLine(vec2 p, float spacing, float widthPx) {
+        vec2 coord = p / spacing;
+        vec2 d = max(fwidth(coord), vec2(1e-6));
+        vec2 g = abs(fract(coord - 0.5) - 0.5) / d;
+        return 1.0 - clamp(min(g.x, g.y) / widthPx, 0.0, 1.0);
+    }
+
+    void material(inout MaterialInputs material) {
+        material.normal = vec3(0.0, 0.0, 1.0);
+        prepareMaterial(material);
+
+        // Antialiased world-space reference grid (250m minor, 1000m major)
+        // dissolving smoothly at grazing/far distances to prevent shimmering
+        vec2 worldXy = variable_vWorldXy.xy;
+        float dist = length(worldXy - materialParams.cameraPos.xy);
+        float farFade = 1.0 - smoothstep(1500.0, 7500.0, dist);
+
+        float minor = gridLine(worldXy, 250.0, 1.0);
+        float major = gridLine(worldXy, 1000.0, 1.25);
+
+        float gridFactor = max(minor * 0.14, major * 0.28) * farFade;
+        vec3 col = mix(materialParams.groundColor, materialParams.groundColor * 0.60, gridFactor);
+
+        material.baseColor = vec4(col, 1.0);
+        material.roughness = materialParams.groundRoughness;
+        material.metallic = 0.0;
+    }
+}

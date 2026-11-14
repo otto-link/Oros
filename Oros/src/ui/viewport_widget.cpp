@@ -69,6 +69,10 @@ static const uint8_t MATERIAL_SKY_ATMOSPHERE_PKG[] = {
 #include "materials/sky_atmosphere.h"
 };
 
+static const uint8_t MATERIAL_GROUND_PLANE_PKG[] = {
+#include "materials/ground_plane_lit.h"
+};
+
 constexpr size_t MAX_INSTANCES_PER_BATCH = 16384;
 constexpr int    INSTANCE_TEX_WIDTH = 128; // 128 instances per row (256 texels)
 
@@ -170,6 +174,14 @@ struct ViewportWidget::Impl
   filament::Material         *sky_material{nullptr};
   filament::MaterialInstance *sky_mat_instance{nullptr};
   bool                        sky_dome_in_scene{false};
+
+  // Optional infinite ground plane
+  utils::Entity               ground_plane_entity{};
+  filament::VertexBuffer     *ground_plane_vb{nullptr};
+  filament::IndexBuffer      *ground_plane_ib{nullptr};
+  filament::Material         *ground_plane_mat{nullptr};
+  filament::MaterialInstance *ground_plane_mat_instance{nullptr};
+  bool                        ground_plane_in_scene{false};
 
   // Materials
   filament::Material *terrain_unlit_mat{nullptr};
@@ -357,6 +369,43 @@ struct ViewportWidget::Impl
     {
       engine->destroy(sky_dome_ib);
       sky_dome_ib = nullptr;
+    }
+
+    if (ground_plane_in_scene && ground_plane_entity)
+    {
+      scene->remove(ground_plane_entity);
+      ground_plane_in_scene = false;
+    }
+
+    if (ground_plane_entity)
+    {
+      engine->destroy(ground_plane_entity);
+      utils::EntityManager::get().destroy(ground_plane_entity);
+      ground_plane_entity = {};
+    }
+
+    if (ground_plane_mat_instance)
+    {
+      engine->destroy(ground_plane_mat_instance);
+      ground_plane_mat_instance = nullptr;
+    }
+
+    if (ground_plane_vb)
+    {
+      engine->destroy(ground_plane_vb);
+      ground_plane_vb = nullptr;
+    }
+
+    if (ground_plane_ib)
+    {
+      engine->destroy(ground_plane_ib);
+      ground_plane_ib = nullptr;
+    }
+
+    if (ground_plane_mat)
+    {
+      engine->destroy(ground_plane_mat);
+      ground_plane_mat = nullptr;
     }
 
     if (shared_grid_vb)
@@ -703,6 +752,16 @@ const scene::EnvironmentSettings &ViewportWidget::get_environment_settings()
   return env_settings_;
 }
 
+float ViewportWidget::get_ground_plane_elevation() const noexcept
+{
+  return env_settings_.ground_plane_elevation;
+}
+
+bool ViewportWidget::is_ground_plane_enabled() const noexcept
+{
+  return env_settings_.ground_plane_enabled;
+}
+
 void ViewportWidget::set_atmospheric_scattering_enabled(bool enabled)
 {
   env_settings_.atmospheric_scattering_enabled = enabled;
@@ -732,6 +791,26 @@ void ViewportWidget::set_fog_enabled(bool enabled)
   if (filament_initialized_)
   {
     update_environment_and_sun();
+  }
+}
+
+void ViewportWidget::set_ground_plane_elevation(float elevation)
+{
+  env_settings_.ground_plane_elevation = elevation;
+
+  if (filament_initialized_)
+  {
+    update_ground_plane();
+  }
+}
+
+void ViewportWidget::set_ground_plane_enabled(bool enabled)
+{
+  env_settings_.ground_plane_enabled = enabled;
+
+  if (filament_initialized_)
+  {
+    update_ground_plane();
   }
 }
 
@@ -1117,6 +1196,11 @@ void ViewportWidget::init_filament()
                                      sizeof(MATERIAL_SKY_ATMOSPHERE_PKG))
                             .build(*impl_->engine);
 
+  impl_->ground_plane_mat = filament::Material::Builder()
+                                .package(MATERIAL_GROUND_PLANE_PKG,
+                                         sizeof(MATERIAL_GROUND_PLANE_PKG))
+                                .build(*impl_->engine);
+
   // Create fallback 1x1 white texture
   impl_->fallback_white_tex = filament::Texture::Builder()
                                   .width(1)
@@ -1248,6 +1332,100 @@ void ViewportWidget::init_filament()
         .build(*impl_->engine, impl_->sky_dome_entity);
   }
 
+  // Build Optional Infinite Ground Plane Mesh (large quad centered on camera)
+  {
+    const float                         extent = 50000.0f;
+    std::vector<filament::math::float3> gp_verts = {{-extent, -extent, 0.0f},
+                                                    {extent, -extent, 0.0f},
+                                                    {extent, extent, 0.0f},
+                                                    {-extent, extent, 0.0f}};
+
+    filament::math::mat3f tbn;
+    tbn[0] = filament::math::float3(1.0f, 0.0f, 0.0f);
+    tbn[1] = filament::math::float3(0.0f, 1.0f, 0.0f);
+    tbn[2] = filament::math::float3(0.0f, 0.0f, 1.0f);
+    const filament::math::quatf flat_tangent =
+        filament::math::mat3f::packTangentFrame(tbn);
+    std::vector<filament::math::quatf> gp_tangents(4, flat_tangent);
+
+    std::vector<uint32_t> gp_indices = {0, 1, 2, 0, 2, 3};
+
+    impl_->ground_plane_vb =
+        filament::VertexBuffer::Builder()
+            .vertexCount(4)
+            .bufferCount(2)
+            .attribute(filament::VertexAttribute::POSITION,
+                       0,
+                       filament::VertexBuffer::AttributeType::FLOAT3,
+                       0,
+                       sizeof(filament::math::float3))
+            .attribute(filament::VertexAttribute::TANGENTS,
+                       1,
+                       filament::VertexBuffer::AttributeType::FLOAT4,
+                       0,
+                       sizeof(filament::math::quatf))
+            .build(*impl_->engine);
+
+    auto *gp_v_copy = new std::vector<filament::math::float3>(
+        std::move(gp_verts));
+    impl_->ground_plane_vb->setBufferAt(
+        *impl_->engine,
+        0,
+        filament::VertexBuffer::BufferDescriptor(
+            gp_v_copy->data(),
+            gp_v_copy->size() * sizeof(filament::math::float3),
+            [](void * /*b*/, size_t /*s*/, void *u)
+            { delete static_cast<std::vector<filament::math::float3> *>(u); },
+            gp_v_copy));
+
+    auto *gp_t_copy = new std::vector<filament::math::quatf>(
+        std::move(gp_tangents));
+    impl_->ground_plane_vb->setBufferAt(
+        *impl_->engine,
+        1,
+        filament::VertexBuffer::BufferDescriptor(
+            gp_t_copy->data(),
+            gp_t_copy->size() * sizeof(filament::math::quatf),
+            [](void * /*b*/, size_t /*s*/, void *u)
+            { delete static_cast<std::vector<filament::math::quatf> *>(u); },
+            gp_t_copy));
+
+    impl_->ground_plane_ib = filament::IndexBuffer::Builder()
+                                 .indexCount(6)
+                                 .bufferType(
+                                     filament::IndexBuffer::IndexType::UINT)
+                                 .build(*impl_->engine);
+
+    auto *gp_i_copy = new std::vector<uint32_t>(std::move(gp_indices));
+    impl_->ground_plane_ib->setBuffer(
+        *impl_->engine,
+        filament::IndexBuffer::BufferDescriptor(
+            gp_i_copy->data(),
+            gp_i_copy->size() * sizeof(uint32_t),
+            [](void * /*b*/, size_t /*s*/, void *u)
+            { delete static_cast<std::vector<uint32_t> *>(u); },
+            gp_i_copy));
+
+    impl_->ground_plane_entity = utils::EntityManager::get().create();
+    impl_->ground_plane_mat_instance = impl_->ground_plane_mat
+                                           ->createInstance();
+
+    filament::RenderableManager::Builder(1)
+        .boundingBox({{-100000.0f, -100000.0f, -10000.0f},
+                      {100000.0f, 100000.0f, 10000.0f}})
+        .material(0, impl_->ground_plane_mat_instance)
+        .geometry(0,
+                  filament::RenderableManager::PrimitiveType::TRIANGLES,
+                  impl_->ground_plane_vb,
+                  impl_->ground_plane_ib,
+                  0,
+                  6)
+        .castShadows(false)
+        .receiveShadows(true)
+        .culling(false)
+        .build(*impl_->engine, impl_->ground_plane_entity);
+  }
+
   update_shared_grid_mesh();
 
   filament_initialized_ = true;
@@ -1290,6 +1468,7 @@ void ViewportWidget::recompute_all_lods()
   {
     update_camera();
     update_sky_dome();
+    update_ground_plane();
     update_terrain_renderables();
   }
 
@@ -1472,23 +1651,31 @@ void ViewportWidget::update_environment_and_sun()
   filament::View::FogOptions fog_options;
   fog_options.enabled = pbr && env_settings_.fog_enabled;
   fog_options.distance = env_settings_.fog_start;
-  fog_options.cutOffDistance = 9000.0f;
+  fog_options.cutOffDistance = std::numeric_limits<float>::infinity();
   fog_options.density = env_settings_.fog_density;
   fog_options.height = env_settings_.fog_height;
   fog_options.heightFalloff = env_settings_.fog_height_falloff;
-  fog_options.maximumOpacity = 0.88f;
+  fog_options.maximumOpacity = 1.0f;
 
-  // Match fog tint to horizon scattering color
-  const float sunset_blend = std::clamp(
-      1.0f - std::abs(sun_settings_.elevation_deg - 5.0f) / 25.0f,
-      0.0f,
-      1.0f);
-  const float fog_r = (0.50f * (1.0f - sunset_blend) + 0.92f * sunset_blend) *
-                      day_factor;
-  const float fog_g = (0.68f * (1.0f - sunset_blend) + 0.52f * sunset_blend) *
-                      day_factor;
-  const float fog_b = (0.88f * (1.0f - sunset_blend) + 0.35f * sunset_blend) *
-                      day_factor;
+  // Match fog tint to sky_atmosphere.mat horizonCol for seamless horizon
+  // blending
+  const float sun_elev_sin = std::sin(
+      qDegreesToRadians(sun_settings_.elevation_deg));
+  const float sky_day = std::clamp((sun_elev_sin + 0.12f) / 0.65f, 0.0f, 1.0f);
+  const float sky_sunset = std::clamp(1.0f -
+                                          std::abs(sun_elev_sin - 0.06f) * 4.5f,
+                                      0.0f,
+                                      1.0f);
+  const float h_blend = std::clamp(sky_day + sky_sunset * 0.7f, 0.0f, 1.0f);
+  const float s_blend = sky_sunset * 0.85f;
+
+  const float day_sunset_r = 0.45f * (1.0f - s_blend) + 0.95f * s_blend;
+  const float day_sunset_g = 0.68f * (1.0f - s_blend) + 0.42f * s_blend;
+  const float day_sunset_b = 0.92f * (1.0f - s_blend) + 0.16f * s_blend;
+
+  const float fog_r = 0.03f * (1.0f - h_blend) + day_sunset_r * h_blend;
+  const float fog_g = 0.04f * (1.0f - h_blend) + day_sunset_g * h_blend;
+  const float fog_b = 0.08f * (1.0f - h_blend) + day_sunset_b * h_blend;
   fog_options.color = {fog_r, fog_g, fog_b};
 
   // Disable Filament's built-in fog in-scattering pow(max(dot, 0.0), size)
@@ -1498,8 +1685,51 @@ void ViewportWidget::update_environment_and_sun()
 
   impl_->view->setFogOptions(fog_options);
 
-  // 5. Update Atmospheric Sky Dome
+  // 5. Update Atmospheric Sky Dome & Optional Ground Plane
   update_sky_dome();
+  update_ground_plane();
+}
+
+void ViewportWidget::update_ground_plane()
+{
+  if (!filament_initialized_ || !impl_->engine ||
+      !impl_->ground_plane_mat_instance)
+  {
+    return;
+  }
+
+  if (env_settings_.ground_plane_enabled)
+  {
+    const QVector3D eye = get_camera_pos();
+    impl_->ground_plane_mat_instance->setParameter(
+        "cameraPos",
+        filament::math::float3(eye.x(), eye.y(), eye.z()));
+    impl_->ground_plane_mat_instance->setParameter(
+        "groundElevation",
+        env_settings_.ground_plane_elevation);
+    impl_->ground_plane_mat_instance->setParameter(
+        "groundColor",
+        filament::math::float3(env_settings_.ground_plane_color.x,
+                               env_settings_.ground_plane_color.y,
+                               env_settings_.ground_plane_color.z));
+    impl_->ground_plane_mat_instance->setParameter(
+        "groundRoughness",
+        env_settings_.ground_plane_roughness);
+
+    if (!impl_->ground_plane_in_scene)
+    {
+      impl_->scene->addEntity(impl_->ground_plane_entity);
+      impl_->ground_plane_in_scene = true;
+    }
+  }
+  else
+  {
+    if (impl_->ground_plane_in_scene)
+    {
+      impl_->scene->remove(impl_->ground_plane_entity);
+      impl_->ground_plane_in_scene = false;
+    }
+  }
 }
 
 void ViewportWidget::update_instanced_renderables()

@@ -73,9 +73,13 @@ public:
 
   [[nodiscard]] const scene::EnvironmentSettings &get_environment_settings()
       const noexcept;
-  void set_atmospheric_scattering_enabled(bool enabled);
+  [[nodiscard]] float get_ground_plane_elevation() const noexcept;
+  [[nodiscard]] bool  is_ground_plane_enabled() const noexcept;
+  void                set_atmospheric_scattering_enabled(bool enabled);
   void set_environment_settings(const scene::EnvironmentSettings &settings);
   void set_fog_enabled(bool enabled);
+  void set_ground_plane_elevation(float elevation);
+  void set_ground_plane_enabled(bool enabled);
   void set_pbr_environment_enabled(bool enabled);
   void set_soft_shadows_enabled(bool enabled);
 
@@ -129,6 +133,7 @@ private:
   void render_frame();
   void update_camera();
   void update_environment_and_sun();
+  void update_ground_plane();
   void update_instanced_renderables();
   void update_shared_grid_mesh();
   void update_sky_dome();

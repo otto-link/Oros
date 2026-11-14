@@ -307,6 +307,31 @@ int main(int argc, char *argv[])
                    viewport,
                    &oros::ui::ViewportWidget::set_fog_enabled);
 
+  auto *ground_check = new QCheckBox("Infinite Ground Plane", env_group);
+  ground_check->setChecked(false);
+  env_layout->addWidget(ground_check);
+  QObject::connect(ground_check,
+                   &QCheckBox::toggled,
+                   viewport,
+                   &oros::ui::ViewportWidget::set_ground_plane_enabled);
+
+  auto *ground_el_lbl = new QLabel("Ground Elevation: 0.0 m", env_group);
+  auto *ground_el_slider = new QSlider(Qt::Horizontal, env_group);
+  ground_el_slider->setRange(-50, 100);
+  ground_el_slider->setValue(0);
+  env_layout->addWidget(ground_el_lbl);
+  env_layout->addWidget(ground_el_slider);
+  QObject::connect(
+      ground_el_slider,
+      &QSlider::valueChanged,
+      [viewport, ground_el_lbl](int val)
+      {
+        const float elev = static_cast<float>(val);
+        ground_el_lbl->setText(
+            QString("Ground Elevation: %1 m").arg(elev, 0, 'f', 1));
+        viewport->set_ground_plane_elevation(elev);
+      });
+
   panel_layout->addWidget(env_group);
 
   // 3. Multi-Terrain Transform Interactive Controls
