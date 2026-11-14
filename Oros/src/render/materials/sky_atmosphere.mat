@@ -4,6 +4,7 @@ material {
     culling : none,
     doubleSided : true,
     depthWrite : false,
+    depthCulling : false,
     vertexDomain : world,
     parameters : [
         {
@@ -99,9 +100,12 @@ fragment {
         // Solar disk and corona
         if (materialParams.renderSunDisk && sunElevation > -0.08 && cosTheta > 0.0) {
             float cosRadius = cos(materialParams.sunDiskAngularRadius);
-            float diskEdge = smoothstep(cosRadius - 0.0004, cosRadius + 0.0001, cosTheta);
-            float corona = pow(max(cosTheta, 1e-4), 256.0) * 1.5;
-            skyColor += materialParams.sunColor * (diskEdge * 12.0 + corona);
+            float diskEdge = smoothstep(cosRadius - 0.0005, cosRadius + 0.0001, cosTheta);
+            float innerGlow = pow(max(cosTheta, 1e-4), 380.0) * 1.4;
+            float outerCorona = pow(max(cosTheta, 1e-4), 36.0) * 0.25;
+            vec3 innerColor = mix(materialParams.sunColor, vec3(1.0, 0.99, 0.94), 0.7) * (innerGlow + outerCorona);
+            vec3 diskCore = vec3(1.0, 0.99, 0.96) * (diskEdge * 18.0);
+            skyColor = mix(skyColor + innerColor, diskCore, diskEdge);
         }
 
         material.baseColor = vec4(skyColor, 1.0);

@@ -243,17 +243,17 @@ int main(int argc, char *argv[])
   auto *sun_group = new QGroupBox("Sun & Sky Trajectory", panel);
   auto *sun_layout = new QVBoxLayout(sun_group);
 
-  auto *az_lbl = new QLabel("Sun Azimuth: 135 deg", sun_group);
+  auto *az_lbl = new QLabel("Sun Azimuth: 125 deg", sun_group);
   auto *az_slider = new QSlider(Qt::Horizontal, sun_group);
   az_slider->setRange(0, 360);
-  az_slider->setValue(135);
+  az_slider->setValue(125);
   sun_layout->addWidget(az_lbl);
   sun_layout->addWidget(az_slider);
 
-  auto *el_lbl = new QLabel("Sun Elevation: 35 deg", sun_group);
+  auto *el_lbl = new QLabel("Sun Elevation: 18 deg", sun_group);
   auto *el_slider = new QSlider(Qt::Horizontal, sun_group);
   el_slider->setRange(-5, 90);
-  el_slider->setValue(35);
+  el_slider->setValue(18);
   sun_layout->addWidget(el_lbl);
   sun_layout->addWidget(el_slider);
 

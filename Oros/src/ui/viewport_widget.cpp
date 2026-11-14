@@ -1040,16 +1040,22 @@ void ViewportWidget::init_filament()
   impl_->view->setPostProcessingEnabled(true);
   impl_->view->setShadowType(filament::ShadowType::PCF);
 
+  filament::View::BloomOptions bloom_options;
+  bloom_options.enabled = true;
+  bloom_options.strength = 0.08f;
+  impl_->view->setBloomOptions(bloom_options);
+
   filament::View::SoftShadowOptions soft_shadow_options;
   soft_shadow_options.penumbraScale = 1.2f;
   soft_shadow_options.penumbraRatioScale = 1.2f;
   impl_->view->setSoftShadowOptions(soft_shadow_options);
 
-  // Skybox fallback
+  // Skybox fallback (used only when atmospheric sky dome is disabled)
   impl_->skybox = filament::Skybox::Builder()
                       .color({0.14f, 0.16f, 0.22f, 1.0f})
+                      .showSun(true)
                       .build(*impl_->engine);
-  impl_->scene->setSkybox(impl_->skybox);
+  impl_->scene->setSkybox(nullptr);
 
   // Camera
   impl_->camera_entity = utils::EntityManager::get().create();
@@ -1233,7 +1239,8 @@ void ViewportWidget::init_filament()
                   impl_->sky_dome_ib,
                   0,
                   impl_->sky_dome_index_count)
-        .priority(6)
+        .channel(0)
+        .priority(0)
         .castShadows(false)
         .receiveShadows(false)
         .fog(false)
@@ -1950,6 +1957,7 @@ void ViewportWidget::update_sky_dome()
 
     if (!impl_->sky_dome_in_scene)
     {
+      impl_->scene->setSkybox(nullptr);
       impl_->scene->addEntity(impl_->sky_dome_entity);
       impl_->sky_dome_in_scene = true;
     }
@@ -1961,6 +1969,7 @@ void ViewportWidget::update_sky_dome()
       impl_->scene->remove(impl_->sky_dome_entity);
       impl_->sky_dome_in_scene = false;
     }
+    impl_->scene->setSkybox(impl_->skybox);
   }
 }
 

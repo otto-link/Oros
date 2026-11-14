@@ -106,13 +106,13 @@ public:
 
 struct SunSettings
 {
-  float         azimuth_deg{135.0f};
-  float         elevation_deg{35.0f};
+  float         azimuth_deg{125.0f};
+  float         elevation_deg{18.0f};
   float         intensity{95000.0f};
   terrain::Vec3 base_color{1.0f, 0.98f, 0.92f};
   bool          auto_color_temperature{true};
   bool          render_sun_disk{true};
-  float         sun_angular_radius_deg{0.545f};
+  float         sun_angular_radius_deg{0.65f};
 };
 
 // --- Sun physical helper functions
