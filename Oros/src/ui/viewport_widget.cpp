@@ -152,6 +152,26 @@ struct InstancedGroupGpuEntry
   bool                           gpu_dirty{true};
 };
 
+struct PathGpuEntry
+{
+  scene::PathDescriptor       path{};
+  filament::VertexBuffer     *vb{nullptr};
+  filament::IndexBuffer      *ib{nullptr};
+  uint32_t                    index_count{0};
+  filament::MaterialInstance *mat_instance{nullptr};
+  filament::Texture          *instance_data_tex{nullptr};
+  utils::Entity               entity{};
+  bool                        in_scene{false};
+  bool                        gpu_dirty{true};
+};
+
+enum class PathDragMode : uint8_t
+{
+  NONE = 0,
+  XY_PLANE,
+  Z_AXIS
+};
+
 struct ViewportWidget::Impl
 {
   filament::Engine        *engine{nullptr};
@@ -206,6 +226,59 @@ struct ViewportWidget::Impl
 
   // Instanced objects state
   std::map<std::string, InstancedGroupGpuEntry> instanced_groups{};
+
+  // Interactive paths state
+  std::map<std::string, PathGpuEntry> paths{};
+  std::string                         selected_path_id{};
+  int                                 selected_point_index{-1};
+  PathDragMode                        path_drag_mode{PathDragMode::NONE};
+
+  void destroy_path_gpu(PathGpuEntry &entry)
+  {
+    if (!engine)
+    {
+      return;
+    }
+
+    if (entry.in_scene && scene && entry.entity)
+    {
+      scene->remove(entry.entity);
+      entry.in_scene = false;
+    }
+
+    if (entry.entity)
+    {
+      engine->destroy(entry.entity);
+      utils::EntityManager::get().destroy(entry.entity);
+      entry.entity = {};
+    }
+
+    if (entry.mat_instance)
+    {
+      engine->destroy(entry.mat_instance);
+      entry.mat_instance = nullptr;
+    }
+
+    if (entry.instance_data_tex)
+    {
+      engine->destroy(entry.instance_data_tex);
+      entry.instance_data_tex = nullptr;
+    }
+
+    if (entry.vb)
+    {
+      engine->destroy(entry.vb);
+      entry.vb = nullptr;
+    }
+
+    if (entry.ib)
+    {
+      engine->destroy(entry.ib);
+      entry.ib = nullptr;
+    }
+
+    entry.index_count = 0;
+  }
 
   void destroy_terrain_textures(TerrainGpuEntry &entry)
   {
@@ -338,6 +411,11 @@ struct ViewportWidget::Impl
     for (auto &[id, g_entry] : instanced_groups)
     {
       destroy_instanced_group_gpu(g_entry);
+    }
+
+    for (auto &[id, p_entry] : paths)
+    {
+      destroy_path_gpu(p_entry);
     }
 
     if (sky_dome_in_scene && sky_dome_entity)
@@ -716,6 +794,56 @@ void ViewportWidget::remove_instanced_group(const std::string &id)
   }
 }
 
+// --- Interactive path management
+
+void ViewportWidget::add_or_update_path(const scene::PathDescriptor &path)
+{
+  auto &entry = impl_->paths[path.id];
+  entry.path = path;
+  entry.gpu_dirty = true;
+
+  if (impl_->selected_path_id == path.id &&
+      impl_->selected_point_index >= static_cast<int>(path.points.size()))
+  {
+    impl_->selected_point_index = -1;
+    impl_->path_drag_mode = PathDragMode::NONE;
+  }
+}
+
+void ViewportWidget::clear_paths()
+{
+  for (auto &[id, entry] : impl_->paths)
+  {
+    impl_->destroy_path_gpu(entry);
+  }
+  impl_->paths.clear();
+  impl_->selected_path_id.clear();
+  impl_->selected_point_index = -1;
+  impl_->path_drag_mode = PathDragMode::NONE;
+}
+
+size_t ViewportWidget::get_path_count() const noexcept
+{
+  return impl_->paths.size();
+}
+
+void ViewportWidget::remove_path(const std::string &id)
+{
+  auto it = impl_->paths.find(id);
+  if (it != impl_->paths.end())
+  {
+    impl_->destroy_path_gpu(it->second);
+    impl_->paths.erase(it);
+
+    if (impl_->selected_path_id == id)
+    {
+      impl_->selected_path_id.clear();
+      impl_->selected_point_index = -1;
+      impl_->path_drag_mode = PathDragMode::NONE;
+    }
+  }
+}
+
 // --- Sun & Sky controls
 
 const scene::SunSettings &ViewportWidget::get_sun_settings() const noexcept
@@ -983,8 +1111,382 @@ void ViewportWidget::set_camera_orbit(const QVector3D &target,
 
 // --- Protected Qt events
 
+namespace
+{
+
+void compute_camera_ray(const QPoint    &pos,
+                        int              width,
+                        int              height,
+                        const QVector3D &eye,
+                        const QVector3D &target,
+                        QVector3D       &ray_origin,
+                        QVector3D       &ray_dir)
+{
+  const float w = static_cast<float>(std::max(width, 1));
+  const float h = static_cast<float>(std::max(height, 1));
+  const float ndc_x = (2.0f * static_cast<float>(pos.x()) / w) - 1.0f;
+  const float ndc_y = 1.0f - (2.0f * static_cast<float>(pos.y()) / h);
+
+  const QVector3D forward = (target - eye).normalized();
+  const QVector3D world_up(0.0f, 0.0f, 1.0f);
+  QVector3D       right = QVector3D::crossProduct(forward, world_up);
+  if (right.lengthSquared() < 1e-6f)
+  {
+    right = QVector3D(1.0f, 0.0f, 0.0f);
+  }
+  else
+  {
+    right.normalize();
+  }
+  const QVector3D up = QVector3D::crossProduct(right, forward).normalized();
+
+  const float fov_rad = qDegreesToRadians(45.0f);
+  const float tan_half_fov = std::tan(fov_rad * 0.5f);
+  const float aspect = w / h;
+
+  ray_origin = eye;
+  ray_dir = (forward + right * (ndc_x * tan_half_fov * aspect) +
+             up * (ndc_y * tan_half_fov))
+                .normalized();
+}
+
+bool ray_sphere_intersect(const QVector3D &origin,
+                          const QVector3D &dir,
+                          const QVector3D &center,
+                          float            radius,
+                          float           &t_out)
+{
+  const QVector3D oc = origin - center;
+  const float     b = QVector3D::dotProduct(oc, dir);
+  const float     c = QVector3D::dotProduct(oc, oc) - radius * radius;
+  const float     disc = b * b - c;
+  if (disc < 0.0f)
+  {
+    return false;
+  }
+
+  const float sqrt_disc = std::sqrt(disc);
+  float       t = -b - sqrt_disc;
+  if (t < 0.0f)
+  {
+    t = -b + sqrt_disc;
+  }
+  if (t < 0.0f)
+  {
+    return false;
+  }
+
+  t_out = t;
+  return true;
+}
+
+bool ray_plane_intersect(const QVector3D &origin,
+                         const QVector3D &dir,
+                         const QVector3D &plane_point,
+                         const QVector3D &plane_normal,
+                         QVector3D       &hit_out)
+{
+  const float denom = QVector3D::dotProduct(dir, plane_normal);
+  if (std::abs(denom) < 1e-6f)
+  {
+    return false;
+  }
+
+  const float t = QVector3D::dotProduct(plane_point - origin, plane_normal) /
+                  denom;
+  if (t < 0.0f)
+  {
+    return false;
+  }
+
+  hit_out = origin + dir * t;
+  return true;
+}
+
+float ray_segment_closest_point(const QVector3D &ray_origin,
+                                const QVector3D &ray_dir,
+                                const QVector3D &seg_a,
+                                const QVector3D &seg_b,
+                                float           &seg_u_out)
+{
+  const QVector3D u = ray_dir;
+  const QVector3D v = seg_b - seg_a;
+  const QVector3D w = ray_origin - seg_a;
+
+  const float a = QVector3D::dotProduct(u, u);
+  const float b = QVector3D::dotProduct(u, v);
+  const float c = QVector3D::dotProduct(v, v);
+  const float d = QVector3D::dotProduct(u, w);
+  const float e = QVector3D::dotProduct(v, w);
+  const float denom = a * c - b * b;
+
+  float sc = 0.0f;
+  float tc = 0.0f;
+
+  if (denom < 1e-6f)
+  {
+    sc = 0.0f;
+    tc = (b > c ? d / b : e / c);
+  }
+  else
+  {
+    sc = (b * e - c * d) / denom;
+    tc = (a * e - b * d) / denom;
+  }
+
+  sc = std::max(sc, 0.0f);
+  tc = std::clamp(tc, 0.0f, 1.0f);
+
+  const QVector3D closest_ray = ray_origin + u * sc;
+  const QVector3D closest_seg = seg_a + v * tc;
+  seg_u_out = tc;
+  return (closest_ray - closest_seg).length();
+}
+
+void append_sphere_mesh(std::vector<filament::math::float3> &positions,
+                        std::vector<uint32_t>               &indices,
+                        const terrain::Vec3                 &center,
+                        float                                radius,
+                        int                                  rings = 8,
+                        int                                  sectors = 12)
+{
+  const uint32_t  base_idx = static_cast<uint32_t>(positions.size());
+  constexpr float pi = 3.14159265358979323846f;
+
+  for (int r = 0; r <= rings; ++r)
+  {
+    const float phi = pi * static_cast<float>(r) / static_cast<float>(rings);
+    const float sin_phi = std::sin(phi);
+    const float cos_phi = std::cos(phi);
+
+    for (int s = 0; s <= sectors; ++s)
+    {
+      const float theta = 2.0f * pi * static_cast<float>(s) /
+                          static_cast<float>(sectors);
+      const float x = center.x + radius * sin_phi * std::cos(theta);
+      const float y = center.y + radius * sin_phi * std::sin(theta);
+      const float z = center.z + radius * cos_phi;
+      positions.emplace_back(x, y, z);
+    }
+  }
+
+  for (int r = 0; r < rings; ++r)
+  {
+    for (int s = 0; s < sectors; ++s)
+    {
+      const uint32_t i0 = base_idx +
+                          static_cast<uint32_t>(r * (sectors + 1) + s);
+      const uint32_t i1 = i0 + 1;
+      const uint32_t i2 = i0 + static_cast<uint32_t>(sectors + 1);
+      const uint32_t i3 = i2 + 1;
+
+      indices.push_back(i0);
+      indices.push_back(i2);
+      indices.push_back(i1);
+
+      indices.push_back(i1);
+      indices.push_back(i2);
+      indices.push_back(i3);
+    }
+  }
+}
+
+void append_cylinder_mesh(std::vector<filament::math::float3> &positions,
+                          std::vector<uint32_t>               &indices,
+                          const terrain::Vec3                 &p0,
+                          const terrain::Vec3                 &p1,
+                          float                                radius,
+                          int                                  sectors = 8)
+{
+  const QVector3D a(p0.x, p0.y, p0.z);
+  const QVector3D b(p1.x, p1.y, p1.z);
+  const QVector3D dir = b - a;
+  if (dir.lengthSquared() < 1e-8f)
+  {
+    return;
+  }
+
+  const QVector3D axis = dir.normalized();
+  const QVector3D ref = (std::abs(axis.z()) < 0.9f)
+                            ? QVector3D(0.0f, 0.0f, 1.0f)
+                            : QVector3D(1.0f, 0.0f, 0.0f);
+  const QVector3D u = QVector3D::crossProduct(axis, ref).normalized();
+  const QVector3D v = QVector3D::crossProduct(axis, u).normalized();
+
+  const uint32_t  base_idx = static_cast<uint32_t>(positions.size());
+  constexpr float pi = 3.14159265358979323846f;
+
+  for (int s = 0; s <= sectors; ++s)
+  {
+    const float theta = 2.0f * pi * static_cast<float>(s) /
+                        static_cast<float>(sectors);
+    const QVector3D offset = (u * std::cos(theta) + v * std::sin(theta)) *
+                             radius;
+    const QVector3D va = a + offset;
+    const QVector3D vb = b + offset;
+    positions.emplace_back(va.x(), va.y(), va.z());
+    positions.emplace_back(vb.x(), vb.y(), vb.z());
+  }
+
+  for (int s = 0; s < sectors; ++s)
+  {
+    const uint32_t i0 = base_idx + static_cast<uint32_t>(s * 2);
+    const uint32_t i1 = i0 + 1;
+    const uint32_t i2 = i0 + 2;
+    const uint32_t i3 = i0 + 3;
+
+    indices.push_back(i0);
+    indices.push_back(i2);
+    indices.push_back(i1);
+
+    indices.push_back(i1);
+    indices.push_back(i2);
+    indices.push_back(i3);
+  }
+}
+
+} // namespace
+
+void ViewportWidget::mouseDoubleClickEvent(QMouseEvent *event)
+{
+  if (event->button() == Qt::LeftButton && !impl_->paths.empty())
+  {
+    QVector3D ray_origin;
+    QVector3D ray_dir;
+    compute_camera_ray(event->pos(),
+                       width(),
+                       height(),
+                       get_camera_pos(),
+                       get_camera_target(),
+                       ray_origin,
+                       ray_dir);
+
+    std::string best_path_id{};
+    size_t      best_seg_idx = 0;
+    float       best_seg_u = 0.5f;
+    float       best_dist = std::numeric_limits<float>::max();
+
+    for (const auto &[id, entry] : impl_->paths)
+    {
+      const auto &pts = entry.path.points;
+      if (pts.size() < 2)
+      {
+        continue;
+      }
+
+      const float hit_threshold = std::max(entry.path.point_radius * 1.5f,
+                                           2.0f);
+      for (size_t i = 0; i + 1 < pts.size(); ++i)
+      {
+        const QVector3D a(pts[i].x, pts[i].y, pts[i].z);
+        const QVector3D b(pts[i + 1].x, pts[i + 1].y, pts[i + 1].z);
+        float           seg_u = 0.5f;
+        const float     dist = ray_segment_closest_point(ray_origin,
+                                                     ray_dir,
+                                                     a,
+                                                     b,
+                                                     seg_u);
+        if (dist < hit_threshold && dist < best_dist)
+        {
+          best_dist = dist;
+          best_path_id = id;
+          best_seg_idx = i;
+          best_seg_u = seg_u;
+        }
+      }
+    }
+
+    if (!best_path_id.empty())
+    {
+      auto               &entry = impl_->paths[best_path_id];
+      const auto         &a = entry.path.points[best_seg_idx];
+      const auto         &b = entry.path.points[best_seg_idx + 1];
+      const terrain::Vec3 new_pt{a.x + (b.x - a.x) * best_seg_u,
+                                 a.y + (b.y - a.y) * best_seg_u,
+                                 a.z + (b.z - a.z) * best_seg_u};
+
+      const int new_idx = static_cast<int>(best_seg_idx + 1);
+      entry.path.points.insert(entry.path.points.begin() + new_idx, new_pt);
+      entry.gpu_dirty = true;
+
+      impl_->selected_path_id = best_path_id;
+      impl_->selected_point_index = new_idx;
+
+      emit path_point_selected(best_path_id, new_idx);
+      emit path_changed(best_path_id, entry.path.points);
+      event->accept();
+      return;
+    }
+  }
+
+  QWidget::mouseDoubleClickEvent(event);
+}
+
 void ViewportWidget::mouseMoveEvent(QMouseEvent *event)
 {
+  if (impl_->path_drag_mode != PathDragMode::NONE &&
+      !impl_->selected_path_id.empty() && impl_->selected_point_index >= 0)
+  {
+    auto it = impl_->paths.find(impl_->selected_path_id);
+    if (it != impl_->paths.end() &&
+        impl_->selected_point_index <
+            static_cast<int>(it->second.path.points.size()))
+    {
+      QVector3D ray_origin;
+      QVector3D ray_dir;
+      compute_camera_ray(event->pos(),
+                         width(),
+                         height(),
+                         get_camera_pos(),
+                         get_camera_target(),
+                         ray_origin,
+                         ray_dir);
+
+      auto           &pt = it->second.path.points[impl_->selected_point_index];
+      const QVector3D cur_pt(pt.x, pt.y, pt.z);
+      QVector3D       hit;
+
+      if (impl_->path_drag_mode == PathDragMode::XY_PLANE)
+      {
+        if (ray_plane_intersect(ray_origin,
+                                ray_dir,
+                                cur_pt,
+                                QVector3D(0.0f, 0.0f, 1.0f),
+                                hit))
+        {
+          pt.x = hit.x();
+          pt.y = hit.y();
+          it->second.gpu_dirty = true;
+          emit path_changed(impl_->selected_path_id, it->second.path.points);
+        }
+      }
+      else if (impl_->path_drag_mode == PathDragMode::Z_AXIS)
+      {
+        QVector3D cam_horiz = get_camera_target() - get_camera_pos();
+        cam_horiz.setZ(0.0f);
+        if (cam_horiz.lengthSquared() < 1e-6f)
+        {
+          cam_horiz = QVector3D(1.0f, 0.0f, 0.0f);
+        }
+        else
+        {
+          cam_horiz.normalize();
+        }
+
+        if (ray_plane_intersect(ray_origin, ray_dir, cur_pt, cam_horiz, hit))
+        {
+          pt.z = hit.z();
+          it->second.gpu_dirty = true;
+          emit path_changed(impl_->selected_path_id, it->second.path.points);
+        }
+      }
+
+      last_mouse_pos_ = event->pos();
+      event->accept();
+      return;
+    }
+  }
+
   const QPoint delta = event->pos() - last_mouse_pos_;
   last_mouse_pos_ = event->pos();
 
@@ -1017,6 +1519,99 @@ void ViewportWidget::mouseMoveEvent(QMouseEvent *event)
 
 void ViewportWidget::mousePressEvent(QMouseEvent *event)
 {
+  if (event->button() == Qt::LeftButton && !impl_->paths.empty())
+  {
+    QVector3D ray_origin;
+    QVector3D ray_dir;
+    compute_camera_ray(event->pos(),
+                       width(),
+                       height(),
+                       get_camera_pos(),
+                       get_camera_target(),
+                       ray_origin,
+                       ray_dir);
+
+    // 1. Check Z-axis gizmo handle of the currently selected point first
+    if (!impl_->selected_path_id.empty() && impl_->selected_point_index >= 0)
+    {
+      auto it = impl_->paths.find(impl_->selected_path_id);
+      if (it != impl_->paths.end() &&
+          impl_->selected_point_index <
+              static_cast<int>(it->second.path.points.size()))
+      {
+        const auto &pt = it->second.path.points[impl_->selected_point_index];
+        const float r = it->second.path.point_radius;
+        const QVector3D z_handle_pos(pt.x, pt.y, pt.z + r * 3.5f);
+        float           t_hit = 0.0f;
+        if (ray_sphere_intersect(ray_origin,
+                                 ray_dir,
+                                 z_handle_pos,
+                                 r * 1.1f,
+                                 t_hit))
+        {
+          impl_->path_drag_mode = PathDragMode::Z_AXIS;
+          last_mouse_pos_ = event->pos();
+          event->accept();
+          return;
+        }
+      }
+    }
+
+    // 2. Check all path control points
+    std::string best_path_id{};
+    int         best_pt_idx = -1;
+    float       best_t = std::numeric_limits<float>::max();
+
+    for (const auto &[id, entry] : impl_->paths)
+    {
+      const float hit_r = std::max(entry.path.point_radius * 1.25f, 1.5f);
+      for (size_t i = 0; i < entry.path.points.size(); ++i)
+      {
+        const auto     &pt = entry.path.points[i];
+        const QVector3D center(pt.x, pt.y, pt.z);
+        float           t_hit = 0.0f;
+        if (ray_sphere_intersect(ray_origin, ray_dir, center, hit_r, t_hit) &&
+            t_hit < best_t)
+        {
+          best_t = t_hit;
+          best_path_id = id;
+          best_pt_idx = static_cast<int>(i);
+        }
+      }
+    }
+
+    if (!best_path_id.empty())
+    {
+      const std::string prev_id = impl_->selected_path_id;
+      const int         prev_idx = impl_->selected_point_index;
+
+      if (!prev_id.empty() && prev_id != best_path_id)
+      {
+        auto prev_it = impl_->paths.find(prev_id);
+        if (prev_it != impl_->paths.end())
+        {
+          prev_it->second.gpu_dirty = true;
+        }
+      }
+
+      impl_->selected_path_id = best_path_id;
+      impl_->selected_point_index = best_pt_idx;
+      impl_->paths[best_path_id].gpu_dirty = true;
+      impl_->path_drag_mode = (event->modifiers() & Qt::ShiftModifier)
+                                  ? PathDragMode::Z_AXIS
+                                  : PathDragMode::XY_PLANE;
+
+      if (prev_id != best_path_id || prev_idx != best_pt_idx)
+      {
+        emit path_point_selected(best_path_id, best_pt_idx);
+      }
+
+      last_mouse_pos_ = event->pos();
+      event->accept();
+      return;
+    }
+  }
+
   is_dragging_ = true;
   last_mouse_pos_ = event->pos();
   QWidget::mousePressEvent(event);
@@ -1024,6 +1619,13 @@ void ViewportWidget::mousePressEvent(QMouseEvent *event)
 
 void ViewportWidget::mouseReleaseEvent(QMouseEvent *event)
 {
+  if (impl_->path_drag_mode != PathDragMode::NONE)
+  {
+    impl_->path_drag_mode = PathDragMode::NONE;
+    event->accept();
+    return;
+  }
+
   is_dragging_ = false;
   QWidget::mouseReleaseEvent(event);
 }
@@ -1482,6 +2084,231 @@ void ViewportWidget::render_frame()
       !impl_->view)
   {
     return;
+  }
+
+  // Update dirty interactive path meshes
+  if (impl_->engine && impl_->scene && impl_->instanced_obj_mat)
+  {
+    filament::TextureSampler nearest_sampler(
+        filament::TextureSampler::MinFilter::NEAREST,
+        filament::TextureSampler::MagFilter::NEAREST,
+        filament::TextureSampler::WrapMode::CLAMP_TO_EDGE);
+
+    for (auto &[id, entry] : impl_->paths)
+    {
+      if (!entry.gpu_dirty)
+      {
+        continue;
+      }
+
+      impl_->destroy_path_gpu(entry);
+
+      const auto &pts = entry.path.points;
+      if (pts.empty())
+      {
+        entry.gpu_dirty = false;
+        continue;
+      }
+
+      std::vector<filament::math::float3> positions;
+      std::vector<filament::math::float4> colors;
+      std::vector<uint32_t>               indices;
+
+      const filament::math::float4 line_col(entry.path.line_color.x,
+                                            entry.path.line_color.y,
+                                            entry.path.line_color.z,
+                                            1.0f);
+      const filament::math::float4 pt_col(entry.path.point_color.x,
+                                          entry.path.point_color.y,
+                                          entry.path.point_color.z,
+                                          1.0f);
+      const filament::math::float4 sel_col(entry.path.selected_color.x,
+                                           entry.path.selected_color.y,
+                                           entry.path.selected_color.z,
+                                           1.0f);
+
+      for (size_t i = 0; i + 1 < pts.size(); ++i)
+      {
+        append_cylinder_mesh(positions,
+                             indices,
+                             pts[i],
+                             pts[i + 1],
+                             entry.path.line_width);
+        colors.resize(positions.size(), line_col);
+      }
+
+      for (size_t i = 0; i < pts.size(); ++i)
+      {
+        const bool  is_sel = (id == impl_->selected_path_id &&
+                             static_cast<int>(i) ==
+                                 impl_->selected_point_index);
+        const float r = is_sel ? entry.path.point_radius * 1.25f
+                               : entry.path.point_radius;
+        append_sphere_mesh(positions, indices, pts[i], r);
+        colors.resize(positions.size(), is_sel ? sel_col : pt_col);
+
+        if (is_sel)
+        {
+          const terrain::Vec3 z_top{pts[i].x,
+                                    pts[i].y,
+                                    pts[i].z + entry.path.point_radius * 3.5f};
+          append_cylinder_mesh(positions,
+                               indices,
+                               pts[i],
+                               z_top,
+                               entry.path.line_width * 0.8f);
+          append_sphere_mesh(positions,
+                             indices,
+                             z_top,
+                             entry.path.point_radius * 0.85f);
+          colors.resize(positions.size(),
+                        filament::math::float4(0.2f, 1.0f, 0.3f, 1.0f));
+        }
+      }
+
+      if (positions.empty() || indices.empty())
+      {
+        entry.gpu_dirty = false;
+        continue;
+      }
+
+      auto *pos_copy = new std::vector<filament::math::float3>(
+          std::move(positions));
+      auto *tan_copy = new std::vector<filament::math::quatf>(
+          pos_copy->size(),
+          filament::math::quatf(0.0f, 0.0f, 0.0f, 1.0f));
+      auto *col_copy = new std::vector<filament::math::float4>(
+          std::move(colors));
+      auto *idx_copy = new std::vector<uint32_t>(std::move(indices));
+      entry.index_count = static_cast<uint32_t>(idx_copy->size());
+
+      entry.vb = filament::VertexBuffer::Builder()
+                     .vertexCount(static_cast<uint32_t>(pos_copy->size()))
+                     .bufferCount(3)
+                     .attribute(filament::VertexAttribute::POSITION,
+                                0,
+                                filament::VertexBuffer::AttributeType::FLOAT3,
+                                0,
+                                sizeof(filament::math::float3))
+                     .attribute(filament::VertexAttribute::TANGENTS,
+                                1,
+                                filament::VertexBuffer::AttributeType::FLOAT4,
+                                0,
+                                sizeof(filament::math::quatf))
+                     .attribute(filament::VertexAttribute::COLOR,
+                                2,
+                                filament::VertexBuffer::AttributeType::FLOAT4,
+                                0,
+                                sizeof(filament::math::float4))
+                     .build(*impl_->engine);
+
+      entry.vb->setBufferAt(
+          *impl_->engine,
+          0,
+          filament::VertexBuffer::BufferDescriptor(
+              pos_copy->data(),
+              pos_copy->size() * sizeof(filament::math::float3),
+              [](void *, size_t, void *user)
+              {
+                delete static_cast<std::vector<filament::math::float3> *>(user);
+              },
+              pos_copy));
+
+      entry.vb->setBufferAt(
+          *impl_->engine,
+          1,
+          filament::VertexBuffer::BufferDescriptor(
+              tan_copy->data(),
+              tan_copy->size() * sizeof(filament::math::quatf),
+              [](void *, size_t, void *user)
+              {
+                delete static_cast<std::vector<filament::math::quatf> *>(user);
+              },
+              tan_copy));
+
+      entry.vb->setBufferAt(
+          *impl_->engine,
+          2,
+          filament::VertexBuffer::BufferDescriptor(
+              col_copy->data(),
+              col_copy->size() * sizeof(filament::math::float4),
+              [](void *, size_t, void *user)
+              {
+                delete static_cast<std::vector<filament::math::float4> *>(user);
+              },
+              col_copy));
+
+      entry.ib = filament::IndexBuffer::Builder()
+                     .indexCount(entry.index_count)
+                     .bufferType(filament::IndexBuffer::IndexType::UINT)
+                     .build(*impl_->engine);
+
+      entry.ib->setBuffer(
+          *impl_->engine,
+          filament::IndexBuffer::BufferDescriptor(
+              idx_copy->data(),
+              idx_copy->size() * sizeof(uint32_t),
+              [](void *, size_t, void *user)
+              { delete static_cast<std::vector<uint32_t> *>(user); },
+              idx_copy));
+
+      // Identity single-instance texture (pos = 0, scale = 1, rot = 0)
+      auto *tex_data = new std::vector<filament::math::float4>{
+          {0.0f, 0.0f, 0.0f, 1.0f},
+          {1.0f, 0.0f, 0.0f, 0.0f},
+      };
+
+      entry.instance_data_tex =
+          filament::Texture::Builder()
+              .width(2)
+              .height(1)
+              .levels(1)
+              .sampler(filament::Texture::Sampler::SAMPLER_2D)
+              .format(filament::Texture::InternalFormat::RGBA32F)
+              .build(*impl_->engine);
+
+      filament::Texture::PixelBufferDescriptor pbd(
+          tex_data->data(),
+          tex_data->size() * sizeof(filament::math::float4),
+          filament::Texture::Format::RGBA,
+          filament::Texture::Type::FLOAT,
+          [](void *, size_t, void *user)
+          { delete static_cast<std::vector<filament::math::float4> *>(user); },
+          tex_data);
+      entry.instance_data_tex->setImage(*impl_->engine, 0, std::move(pbd));
+
+      entry.mat_instance = impl_->instanced_obj_mat->createInstance();
+      entry.mat_instance->setParameter("instanceDataMap",
+                                       entry.instance_data_tex,
+                                       nearest_sampler);
+      entry.mat_instance->setParameter("instanceTexWidth", 2u);
+      entry.mat_instance->setParameter(
+          "baseColorTint",
+          filament::math::float3(1.0f, 1.0f, 1.0f));
+      entry.mat_instance->setParameter("roughness", 0.4f);
+      entry.mat_instance->setParameter("metallic", 0.0f);
+
+      entry.entity = utils::EntityManager::get().create();
+
+      filament::RenderableManager::Builder(1)
+          .boundingBox({{-1e6f, -1e6f, -1e6f}, {1e6f, 1e6f, 1e6f}})
+          .material(0, entry.mat_instance)
+          .geometry(0,
+                    filament::RenderableManager::PrimitiveType::TRIANGLES,
+                    entry.vb,
+                    entry.ib,
+                    0,
+                    entry.index_count)
+          .instances(1)
+          .culling(false)
+          .castShadows(false)
+          .receiveShadows(false)
+          .build(*impl_->engine, entry.entity);
+
+      impl_->scene->addEntity(entry.entity);
+      entry.in_scene = true;
+      entry.gpu_dirty = false;
+    }
   }
 
   const auto   now = std::chrono::steady_clock::now();

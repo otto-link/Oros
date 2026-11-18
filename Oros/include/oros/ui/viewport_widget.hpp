@@ -63,6 +63,13 @@ public:
   [[nodiscard]] size_t get_total_object_instance_count() const noexcept;
   void                 remove_instanced_group(const std::string &id);
 
+  // --- Interactive path management
+
+  void                 add_or_update_path(const scene::PathDescriptor &path);
+  void                 clear_paths();
+  [[nodiscard]] size_t get_path_count() const noexcept;
+  void                 remove_path(const std::string &id);
+
   // --- Sun & Sky controls
 
   [[nodiscard]] const scene::SunSettings &get_sun_settings() const noexcept;
@@ -113,8 +120,12 @@ signals:
   void camera_moved(float x, float y, float z);
   void fps_updated(float fps, float frame_time_ms);
   void lod_selection_updated(size_t active_patch_nodes);
+  void path_changed(const std::string                &id,
+                    const std::vector<terrain::Vec3> &points);
+  void path_point_selected(const std::string &id, int point_index);
 
 protected:
+  void          mouseDoubleClickEvent(QMouseEvent *event) override;
   void          mouseMoveEvent(QMouseEvent *event) override;
   void          mousePressEvent(QMouseEvent *event) override;
   void          mouseReleaseEvent(QMouseEvent *event) override;

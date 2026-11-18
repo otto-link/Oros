@@ -143,6 +143,30 @@ void populate_scatter_objects(oros::ui::ViewportWidget *viewport,
   viewport->add_or_update_instanced_group(pines);
   viewport->add_or_update_instanced_group(deciduous);
   viewport->add_or_update_instanced_group(rocks);
+
+  // Add an interactive 3D path across the main terrain
+  oros::scene::PathDescriptor demo_path;
+  demo_path.id = "demo_path";
+  demo_path.point_radius = 5.0f;
+  demo_path.line_width = 2.0f;
+
+  const std::vector<std::pair<float, float>> path_uvs = {
+      {0.20f, 0.25f},
+      {0.38f, 0.42f},
+      {0.58f, 0.50f},
+      {0.78f, 0.72f},
+  };
+
+  for (const auto &[u, v] : path_uvs)
+  {
+    oros::terrain::Vec3 pt = viewport->sample_terrain_world_pos("main_terrain",
+                                                                u,
+                                                                v);
+    // pt.z += 25.0f;
+    demo_path.points.push_back(pt);
+  }
+
+  viewport->add_or_update_path(demo_path);
 }
 
 } // namespace

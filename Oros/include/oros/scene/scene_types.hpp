@@ -83,6 +83,21 @@ struct InstancedObjectGroup
   std::vector<ObjectInstance> instances{};
 };
 
+// --- PathDescriptor
+// Describes an interactive 3D path made of ordered control points connected
+// by line segments.
+
+struct PathDescriptor
+{
+  std::string                id{};
+  std::vector<terrain::Vec3> points{};
+  terrain::Vec3              line_color{1.0f, 0.75f, 0.2f};
+  terrain::Vec3              point_color{0.2f, 0.7f, 1.0f};
+  terrain::Vec3              selected_color{1.0f, 0.35f, 0.2f};
+  float                      point_radius{4.0f};
+  float                      line_width{1.2f};
+};
+
 // --- Procedural mesh generators for trees and rocks
 
 class ScatterMeshFactory
