@@ -1821,7 +1821,7 @@ void ViewportWidget::init_filament()
 
   // View configuration
   impl_->view->setPostProcessingEnabled(true);
-  impl_->view->setShadowType(filament::ShadowType::PCSS);
+  impl_->view->setShadowType(filament::ShadowType::PCF);
 
   filament::View::BloomOptions bloom_options;
   bloom_options.enabled = true;
@@ -1861,9 +1861,10 @@ void ViewportWidget::init_filament()
   shadow_options.shadowNearHint = cam_near;
   shadow_options.shadowFar = max_dom * 2.5f;
   shadow_options.shadowFarHint = max_dom * 2.5f;
-  shadow_options.normalBias = 0.4f;
+  shadow_options.normalBias = 0.25f;
+  shadow_options.constantBias = 0.0005f;
   shadow_options.stable = true;
-  shadow_options.screenSpaceContactShadows = true;
+  shadow_options.screenSpaceContactShadows = false;
 
   filament::LightManager::ShadowCascades::computePracticalSplits(
       shadow_options.cascadeSplitPositions,
