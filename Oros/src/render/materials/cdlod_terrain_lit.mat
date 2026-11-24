@@ -131,6 +131,10 @@ vertex {
             materialParams.patchCenter.z + height
         );
 
+        if (getPosition().z < -0.5) {
+            finalWorldPos.z = materialParams.patchCenter.z - 20.0;
+        }
+
         material.worldPosition = vec4(finalWorldPos, 1.0) - vec4(getWorldOffset(), 0.0);
 
         vec3 nLocalV = normalize(textureLod(materialParams_normalMap, uvMorphed, 0.0).xyz * 2.0 - 1.0);

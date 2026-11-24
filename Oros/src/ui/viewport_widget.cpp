@@ -2960,13 +2960,50 @@ void ViewportWidget::update_shared_grid_mesh()
   }
 
   const auto   grid = terrain::GridMeshFactory::create_unit_grid(grid_res_);
-  const size_t vertex_count = grid.vertices.size();
+  const size_t base_vertex_count = grid.vertices.size();
 
-  std::vector<filament::math::float3> positions(vertex_count);
-  for (size_t i = 0; i < vertex_count; ++i)
+  std::vector<filament::math::float3> positions;
+  positions.reserve(base_vertex_count + 4 * grid_res_);
+  for (size_t i = 0; i < base_vertex_count; ++i)
   {
-    positions[i] = {grid.vertices[i].u, grid.vertices[i].v, 0.0f};
+    positions.push_back({grid.vertices[i].u, grid.vertices[i].v, 0.0f});
   }
+
+  std::vector<uint32_t> solid_indices = grid.indices;
+  solid_indices.reserve(grid.indices.size() + 4 * (grid_res_ - 1) * 6);
+
+  // Append perimeter skirt vertices (z = -1.0f marker) and quads
+  auto add_skirt_edge = [&](auto index_at)
+  {
+    const uint32_t skirt_start = static_cast<uint32_t>(positions.size());
+    for (size_t k = 0; k < grid_res_; ++k)
+    {
+      const uint32_t top_idx = index_at(k);
+      positions.push_back({positions[top_idx].x, positions[top_idx].y, -1.0f});
+    }
+    for (size_t k = 0; k + 1 < grid_res_; ++k)
+    {
+      const uint32_t t0 = index_at(k);
+      const uint32_t t1 = index_at(k + 1);
+      const uint32_t b0 = skirt_start + static_cast<uint32_t>(k);
+      const uint32_t b1 = b0 + 1;
+      solid_indices.push_back(t0);
+      solid_indices.push_back(b0);
+      solid_indices.push_back(t1);
+      solid_indices.push_back(t1);
+      solid_indices.push_back(b0);
+      solid_indices.push_back(b1);
+    }
+  };
+
+  add_skirt_edge([&](size_t k) { return static_cast<uint32_t>(k); });
+  add_skirt_edge([&](size_t k)
+                 { return static_cast<uint32_t>((grid_res_ - 1) * grid_res_ + k); });
+  add_skirt_edge([&](size_t k) { return static_cast<uint32_t>(k * grid_res_); });
+  add_skirt_edge([&](size_t k)
+                 { return static_cast<uint32_t>(k * grid_res_ + (grid_res_ - 1)); });
+
+  const size_t vertex_count = positions.size();
 
   const filament::math::quatf flat_tangent(1.0f, 0.0f, 0.0f, 0.0f);
   std::vector<filament::math::quatf> tangents(vertex_count, flat_tangent);
@@ -3012,14 +3049,14 @@ void ViewportWidget::update_shared_grid_mesh()
           tan_copy));
 
   // Solid triangle index buffer
-  impl_->solid_index_count = static_cast<uint32_t>(grid.indices.size());
+  impl_->solid_index_count = static_cast<uint32_t>(solid_indices.size());
   impl_->shared_solid_ib = filament::IndexBuffer::Builder()
                                .indexCount(impl_->solid_index_count)
                                .bufferType(
                                    filament::IndexBuffer::IndexType::UINT)
                                .build(*impl_->engine);
 
-  auto *solid_copy = new std::vector<uint32_t>(grid.indices);
+  auto *solid_copy = new std::vector<uint32_t>(std::move(solid_indices));
   impl_->shared_solid_ib->setBuffer(
       *impl_->engine,
       filament::IndexBuffer::BufferDescriptor(
