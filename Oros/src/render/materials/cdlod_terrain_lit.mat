@@ -131,10 +131,10 @@ vertex {
             materialParams.patchCenter.z + height
         );
 
-        // Border skirt: drop outermost domain ring below ground plane to seal underside light leaks
+        // Border skirt: drop outermost domain ring to z=0 to seal underside light leaks
         if (uvMorphed.x <= 1e-4 || uvMorphed.x >= 1.0 - 1e-4 ||
             uvMorphed.y <= 1e-4 || uvMorphed.y >= 1.0 - 1e-4) {
-            finalWorldPos.z = materialParams.patchCenter.z - 50.0;
+            finalWorldPos.z = materialParams.patchCenter.z;
         }
 
         material.worldPosition = vec4(finalWorldPos, 1.0) - vec4(getWorldOffset(), 0.0);
