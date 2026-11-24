@@ -49,6 +49,9 @@ public:
   void                 set_normal_map_enabled(bool enabled);
   void                 set_height_scale_multiplier(float multiplier);
   [[nodiscard]] float  get_height_scale_multiplier() const noexcept;
+  void                 set_rendering_domain(float lx,
+                                            float ly,
+                                            float max_height);
   void                 update_terrain_transform(const std::string   &id,
                                                 const terrain::Vec3 &center,
                                                 float                lx,
@@ -189,6 +192,9 @@ private:
 
   // Terrain global settings
   float height_scale_multiplier_{1.0f};
+  float domain_lx_{1000.0f};
+  float domain_ly_{1000.0f};
+  float domain_max_height_{500.0f};
   bool  albedo_enabled_{true};
   bool  normal_map_enabled_{true};
 

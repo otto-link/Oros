@@ -3275,8 +3275,12 @@ void ViewportWidget::update_terrain_renderables()
       node.in_scene = false;
 
       filament::RenderableManager::Builder(1)
-          .boundingBox(
-              {{-600.0f, -600.0f, -50.0f}, {600.0f, 600.0f, 500.0f}})
+          .boundingBox({{-domain_lx_ * 0.6f,
+                         -domain_ly_ * 0.6f,
+                         -domain_max_height_ * 0.1f},
+                        {domain_lx_ * 0.6f,
+                         domain_ly_ * 0.6f,
+                         domain_max_height_}})
           .material(0, use_lit ? node.lit_instance : node.unlit_instance)
           .geometry(0,
                     prim_type,
@@ -3568,9 +3572,36 @@ void ViewportWidget::set_path_visible(const std::string &id, bool visible)
   }
 }
 
+void ViewportWidget::set_rendering_domain(float lx, float ly, float max_height)
+{
+  domain_lx_ = std::max(0.1f, lx);
+  domain_ly_ = std::max(0.1f, ly);
+  domain_max_height_ = std::max(0.1f, max_height);
+
+  if (filament_initialized_ && impl_->engine)
+  {
+    auto &rm = impl_->engine->getRenderableManager();
+    const filament::Box box(
+        {-domain_lx_ * 0.6f, -domain_ly_ * 0.6f, -domain_max_height_ * 0.1f},
+        {domain_lx_ * 0.6f, domain_ly_ * 0.6f, domain_max_height_});
+    for (const auto &node : impl_->terrain_node_pool)
+    {
+      if (node.entity)
+      {
+        const auto inst = rm.getInstance(node.entity);
+        if (inst)
+        {
+          rm.setAxisAlignedBoundingBox(inst, box);
+        }
+      }
+    }
+  }
+}
+
 void ViewportWidget::reset_camera()
 {
-  set_camera_orbit(QVector3D(0.0f, 0.0f, 0.0f), 900.0f, -45.0f, 32.0f);
+  const float dist = std::max(domain_lx_, domain_ly_) * 0.9f;
+  set_camera_orbit(QVector3D(0.0f, 0.0f, 0.0f), dist, -45.0f, 32.0f);
   set_fov_deg(45.0f);
 }
 
