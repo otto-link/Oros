@@ -1821,7 +1821,7 @@ void ViewportWidget::init_filament()
 
   // View configuration
   impl_->view->setPostProcessingEnabled(true);
-  impl_->view->setShadowType(filament::ShadowType::PCF);
+  impl_->view->setShadowType(filament::ShadowType::PCSS);
 
   filament::View::BloomOptions bloom_options;
   bloom_options.enabled = true;
@@ -1851,21 +1851,26 @@ void ViewportWidget::init_filament()
   // Directional Sun Light with 4-cascade soft shadows
   impl_->sun_light_entity = utils::EntityManager::get().create();
 
+  const float max_dom = std::max(domain_lx_, domain_ly_);
+  const float cam_near = 5.0f;
+  const float cam_far = std::max(4500.0f, max_dom * 4.5f);
+
   filament::LightManager::ShadowOptions shadow_options;
   shadow_options.mapSize = 4096;
   shadow_options.shadowCascades = 4;
-  shadow_options.shadowNearHint = 10.0f;
-  shadow_options.shadowFar = 2200.0f;
-  shadow_options.shadowFarHint = 2200.0f;
+  shadow_options.shadowNearHint = cam_near;
+  shadow_options.shadowFar = max_dom * 2.5f;
+  shadow_options.shadowFarHint = max_dom * 2.5f;
+  shadow_options.normalBias = 0.4f;
   shadow_options.stable = true;
   shadow_options.screenSpaceContactShadows = true;
 
   filament::LightManager::ShadowCascades::computePracticalSplits(
       shadow_options.cascadeSplitPositions,
       shadow_options.shadowCascades,
-      shadow_options.shadowNearHint,
-      shadow_options.shadowFar,
-      0.35f);
+      cam_near,
+      cam_far,
+      0.75f);
 
   filament::LightManager::Builder(filament::LightManager::Type::SUN)
       .color(
@@ -2023,9 +2028,10 @@ void ViewportWidget::init_filament()
     impl_->sky_dome_entity = utils::EntityManager::get().create();
     impl_->sky_mat_instance = impl_->sky_material->createInstance();
 
+    const float gz = env_settings_.ground_plane_elevation;
     filament::RenderableManager::Builder(1)
-        .boundingBox({{-100000.0f, -100000.0f, -100000.0f},
-                      {100000.0f, 100000.0f, 100000.0f}})
+        .boundingBox({{-domain_lx_ * 2.0f, -domain_ly_ * 2.0f, gz - 5.0f},
+                      {domain_lx_ * 2.0f, domain_ly_ * 2.0f, gz + 5.0f}})
         .material(0, impl_->sky_mat_instance)
         .geometry(0,
                   filament::RenderableManager::PrimitiveType::TRIANGLES,
@@ -2452,10 +2458,13 @@ void ViewportWidget::update_camera()
   const float     aspect = static_cast<float>(std::max(1, width())) /
                        static_cast<float>(std::max(1, height()));
 
+  const float cam_far =
+      std::max(4500.0f, std::max(domain_lx_, domain_ly_) * 4.5f);
+
   impl_->camera->setProjection(camera_fov_deg_,
                                aspect,
                                5.0,
-                               18000.0,
+                               cam_far,
                                filament::Camera::Fov::VERTICAL);
   impl_->camera->lookAt(filament::math::float3(eye.x(), eye.y(), eye.z()),
                         filament::math::float3(camera_target_.x(),
@@ -2958,12 +2967,7 @@ void ViewportWidget::update_shared_grid_mesh()
     positions[i] = {grid.vertices[i].u, grid.vertices[i].v, 0.0f};
   }
 
-  filament::math::mat3f tbn;
-  tbn[0] = filament::math::float3(1.0f, 0.0f, 0.0f);
-  tbn[1] = filament::math::float3(0.0f, 1.0f, 0.0f);
-  tbn[2] = filament::math::float3(0.0f, 0.0f, 1.0f);
-  const filament::math::quatf flat_tangent =
-      filament::math::mat3f::packTangentFrame(tbn);
+  const filament::math::quatf flat_tangent(1.0f, 0.0f, 0.0f, 0.0f);
   std::vector<filament::math::quatf> tangents(vertex_count, flat_tangent);
 
   impl_->shared_grid_vb = filament::VertexBuffer::Builder()

@@ -1,8 +1,8 @@
 material {
     name : cdlod_terrain_lit,
     shadingModel : lit,
-    culling : none,
-    doubleSided : true,
+    culling : back,
+    doubleSided : false,
     vertexDomain : world,
     parameters : [
         {
@@ -132,6 +132,11 @@ vertex {
         );
 
         material.worldPosition = vec4(finalWorldPos, 1.0) - vec4(getWorldOffset(), 0.0);
+
+        vec3 nLocalV = normalize(textureLod(materialParams_normalMap, uvMorphed, 0.0).xyz * 2.0 - 1.0);
+        vec2 nRotV = rotateXy(nLocalV.xy, materialParams.patchCosSin);
+        material.worldNormal = normalize(vec3(nRotV, nLocalV.z));
+
         material.vLodColor = vec4(getLodColor(int(round(lodLevel))), 1.0);
         material.vUv = vec4(uvMorphed, 0.0, 0.0);
         material.vSlopeHeight = vec4(normHeight, height, 0.0, 0.0);
