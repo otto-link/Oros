@@ -1855,8 +1855,9 @@ void ViewportWidget::init_filament()
   shadow_options.mapSize = 4096;
   shadow_options.shadowCascades = 4;
   shadow_options.shadowNearHint = 10.0f;
-  shadow_options.shadowFar = 6000.0f;
-  shadow_options.shadowFarHint = 6000.0f;
+  shadow_options.shadowFar = 2200.0f;
+  shadow_options.shadowFarHint = 2200.0f;
+  shadow_options.stable = true;
   shadow_options.screenSpaceContactShadows = true;
 
   filament::LightManager::ShadowCascades::computePracticalSplits(
