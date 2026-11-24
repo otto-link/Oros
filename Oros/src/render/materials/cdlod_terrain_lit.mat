@@ -1,7 +1,7 @@
 material {
     name : cdlod_terrain_lit,
     shadingModel : lit,
-    culling : back,
+    culling : none,
     doubleSided : false,
     vertexDomain : world,
     parameters : [
