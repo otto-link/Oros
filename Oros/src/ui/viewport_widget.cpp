@@ -3434,10 +3434,29 @@ void ViewportWidget::update_terrain_renderables()
     }
   }
 
-  // Hide unused pooled nodes
+  // Hide unused pooled nodes and clear their texture bindings so they never
+  // reference destroyed FTexture handles
   for (size_t i = pool_idx; i < impl_->terrain_node_pool.size(); ++i)
   {
     auto &node = impl_->terrain_node_pool[i];
+    if (node.unlit_instance)
+    {
+      node.unlit_instance->setParameter("heightmap",
+                                        impl_->fallback_white_tex,
+                                        linear_sampler);
+    }
+    if (node.lit_instance)
+    {
+      node.lit_instance->setParameter("heightmap",
+                                      impl_->fallback_white_tex,
+                                      linear_sampler);
+      node.lit_instance->setParameter("normalMap",
+                                      impl_->fallback_white_tex,
+                                      linear_sampler);
+      node.lit_instance->setParameter("albedoMap",
+                                      impl_->fallback_white_tex,
+                                      linear_sampler);
+    }
     if (node.in_scene)
     {
       impl_->scene->remove(node.entity);
@@ -3884,6 +3903,15 @@ void ViewportWidget::update_water_renderables()
   for (size_t i = pool_idx; i < impl_->water_node_pool.size(); ++i)
   {
     auto &node = impl_->water_node_pool[i];
+    if (node.mat_instance)
+    {
+      node.mat_instance->setParameter("heightmap",
+                                      impl_->fallback_white_tex,
+                                      linear_sampler);
+      node.mat_instance->setParameter("waterDepthMap",
+                                      impl_->fallback_white_tex,
+                                      linear_sampler);
+    }
     if (node.in_scene)
     {
       impl_->scene->remove(node.entity);
