@@ -425,14 +425,14 @@ terrain::Vec3 compute_sun_direction(float azimuth_deg,
 
 terrain::Vec3 compute_sun_color_from_elevation(float elevation_deg) noexcept
 {
-  // Smooth atmospheric reddening from horizon (0 deg) to zenith (90 deg)
-  const float t = std::clamp(elevation_deg / 65.0f, 0.0f, 1.0f);
+  // Smooth atmospheric reddening from horizon (0 deg) to daylight (35+ deg)
+  const float t = std::clamp(elevation_deg / 35.0f, 0.0f, 1.0f);
   const float smooth_t = t * t * (3.0f - 2.0f * t);
 
-  // Horizon warm sunset orange/gold -> Zenith neutral warm daylight
+  // Subtle warm horizon -> neutral daylight
   const float r = 1.0f;
-  const float g = 0.48f + 0.50f * smooth_t;
-  const float b = 0.20f + 0.74f * std::pow(smooth_t, 1.3f);
+  const float g = 0.78f + 0.20f * smooth_t;
+  const float b = 0.58f + 0.38f * std::pow(smooth_t, 1.1f);
 
   return {r, g, b};
 }
