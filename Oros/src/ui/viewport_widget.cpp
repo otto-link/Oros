@@ -3276,7 +3276,7 @@ void ViewportWidget::update_terrain_renderables()
 
       filament::RenderableManager::Builder(1)
           .boundingBox(
-              {{-10000.0f, -10000.0f, -2000.0f}, {10000.0f, 10000.0f, 2000.0f}})
+              {{-600.0f, -600.0f, -50.0f}, {600.0f, 600.0f, 500.0f}})
           .material(0, use_lit ? node.lit_instance : node.unlit_instance)
           .geometry(0,
                     prim_type,
