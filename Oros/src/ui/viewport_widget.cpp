@@ -2569,6 +2569,8 @@ void ViewportWidget::update_environment_and_sun()
   ao_options.lowPassFilter = filament::View::QualityLevel::HIGH;
   ao_options.upsampling = filament::View::QualityLevel::HIGH;
   ao_options.bentNormals = true;
+  ao_options.radius = std::max(1.0f, std::max(domain_lx_, domain_ly_) * 0.015f);
+  ao_options.intensity = 1.2f;
   impl_->view->setAmbientOcclusionOptions(ao_options);
 
   // 4. Atmospheric / Height Fog with Sun In-Scattering
