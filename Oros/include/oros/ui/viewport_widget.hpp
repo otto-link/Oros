@@ -12,6 +12,7 @@
 #include "oros/scene/scene_types.hpp"
 
 #include <QColor>
+#include <QImage>
 #include <QPoint>
 #include <QTimer>
 #include <QVector3D>
@@ -43,11 +44,25 @@ public:
   [[nodiscard]] size_t get_active_cdlod_node_count() const noexcept;
   [[nodiscard]] size_t get_terrain_count() const noexcept;
   void                 remove_terrain(const std::string &id);
+  void                 set_terrain_visible(const std::string &id, bool visible);
+  void                 set_albedo_enabled(bool enabled);
+  void                 set_normal_map_enabled(bool enabled);
+  void                 set_height_scale_multiplier(float multiplier);
+  [[nodiscard]] float  get_height_scale_multiplier() const noexcept;
   void                 update_terrain_transform(const std::string   &id,
                                                 const terrain::Vec3 &center,
                                                 float                lx,
                                                 float                ly,
                                                 float                rotation_deg);
+
+  // --- Water layer management
+
+  void add_or_update_water(const scene::WaterLayerDescriptor &descriptor);
+  void clear_waters();
+  void remove_water(const std::string &id);
+  void set_water_visible(const std::string &id, bool visible);
+  [[nodiscard]] const scene::WaterSettings &get_water_settings() const noexcept;
+  void set_water_settings(const scene::WaterSettings &settings);
 
   // Helper to sample world position (x, y, z) on a named terrain at normalized
   // (u, v) in [0, 1]
@@ -62,6 +77,8 @@ public:
   [[nodiscard]] size_t get_instanced_group_count() const noexcept;
   [[nodiscard]] size_t get_total_object_instance_count() const noexcept;
   void                 remove_instanced_group(const std::string &id);
+  void                 set_instanced_group_visible(const std::string &id,
+                                                   bool               visible);
 
   // --- Interactive path management
 
@@ -69,6 +86,7 @@ public:
   void                 clear_paths();
   [[nodiscard]] size_t get_path_count() const noexcept;
   void                 remove_path(const std::string &id);
+  void                 set_path_visible(const std::string &id, bool visible);
 
   // --- Sun & Sky controls
 
@@ -108,13 +126,17 @@ public:
   [[nodiscard]] const QColor &get_background_color() const;
   [[nodiscard]] QVector3D     get_camera_pos() const noexcept;
   [[nodiscard]] QVector3D     get_camera_target() const noexcept;
+  [[nodiscard]] float         get_fov_deg() const noexcept;
   [[nodiscard]] float         get_fps() const;
   [[nodiscard]] float         get_frame_time_ms() const;
+  [[nodiscard]] QImage        grab_framebuffer();
+  void                        reset_camera();
   void                        set_background_color(const QColor &color);
   void                        set_camera_orbit(const QVector3D &target,
                                                float            distance,
                                                float            yaw_deg,
                                                float            pitch_deg);
+  void                        set_fov_deg(float fov_deg);
 
 signals:
   void camera_moved(float x, float y, float z);
@@ -133,6 +155,7 @@ protected:
   QPaintEngine *paintEngine() const override;
   void          resizeEvent(QResizeEvent *event) override;
   void          showEvent(QShowEvent *event) override;
+  void          hideEvent(QHideEvent *event) override;
   void          wheelEvent(QWheelEvent *event) override;
 
 private:
@@ -149,6 +172,7 @@ private:
   void update_shared_grid_mesh();
   void update_sky_dome();
   void update_terrain_renderables();
+  void update_water_renderables();
 
   QColor background_color_{30, 30, 35};
   float  current_fps_{0.0f};
@@ -160,7 +184,13 @@ private:
   float     camera_yaw_{-45.0f};
   float     camera_pitch_{32.0f};
   float     camera_distance_{900.0f};
+  float     camera_fov_deg_{45.0f};
   QVector3D camera_target_{0.0f, 0.0f, 0.0f};
+
+  // Terrain global settings
+  float height_scale_multiplier_{1.0f};
+  bool  albedo_enabled_{true};
+  bool  normal_map_enabled_{true};
 
   // CDLOD global settings
   size_t   grid_res_{33};
@@ -171,9 +201,10 @@ private:
   bool     wireframe_enabled_{false};
   bool     lod_color_debug_{false};
 
-  // Sun and Environment state
+  // Sun, Environment and Water state
   scene::SunSettings         sun_settings_{};
   scene::EnvironmentSettings env_settings_{};
+  scene::WaterSettings       water_settings_{};
 
   QTimer                               *render_timer_{nullptr};
   std::chrono::steady_clock::time_point last_frame_time_{};

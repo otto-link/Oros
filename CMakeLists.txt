@@ -16,9 +16,15 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # --- Build options
 
-option(OROS_BUILD_TESTS "Build Oros tests" ON)
-option(OROS_BUILD_UNITTESTS "Build Oros unit tests" ON)
-option(OROS_BUILD_UI_TESTS "Build Oros UI manual test" ON)
+if(PROJECT_IS_TOP_LEVEL)
+  set(OROS_DEFAULT_BUILD_TESTS ON)
+else()
+  set(OROS_DEFAULT_BUILD_TESTS OFF)
+endif()
+
+option(OROS_BUILD_TESTS "Build Oros tests" ${OROS_DEFAULT_BUILD_TESTS})
+option(OROS_BUILD_UNITTESTS "Build Oros unit tests" ${OROS_DEFAULT_BUILD_TESTS})
+option(OROS_BUILD_UI_TESTS "Build Oros UI manual test" ${OROS_DEFAULT_BUILD_TESTS})
 
 # --- Dependencies
 

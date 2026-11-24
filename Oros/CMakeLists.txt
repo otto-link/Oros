@@ -35,7 +35,8 @@ filament_compile_materials(
   ${CMAKE_CURRENT_SOURCE_DIR}/src/render/materials/cdlod_terrain_lit.mat
   ${CMAKE_CURRENT_SOURCE_DIR}/src/render/materials/ground_plane_lit.mat
   ${CMAKE_CURRENT_SOURCE_DIR}/src/render/materials/instanced_object_lit.mat
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/render/materials/sky_atmosphere.mat)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/render/materials/sky_atmosphere.mat
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/render/materials/water_lit.mat)
 
 # --- Include directories
 

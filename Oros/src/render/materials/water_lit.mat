@@ -1,0 +1,76 @@
+material {
+    name : "CDLODWaterLit",
+    shadingModel : lit,
+    blending : transparent,
+    vertexDomain : world,
+    doubleSided : true,
+    culling : none,
+    depthWrite : false,
+    parameters : [
+        { type : sampler2d, name : heightmap },
+        { type : sampler2d, name : waterDepthMap },
+        { type : float4, name : patchOffsetScale },
+        { type : float3, name : patchCenter },
+        { type : float2, name : patchSize },
+        { type : float2, name : patchCosSin },
+        { type : float, name : heightScale },
+        { type : float4, name : shallowColor },
+        { type : float4, name : deepColor },
+        { type : float4, name : waterParams }
+    ],
+    variables : [
+        vUv
+    ],
+    requires : [
+        position
+    ]
+}
+
+vertex {
+    vec2 rotateXy(vec2 localXy, vec2 cosSin) {
+        return vec2(
+            cosSin.x * localXy.x - cosSin.y * localXy.y,
+            cosSin.y * localXy.x + cosSin.x * localXy.y
+        );
+    }
+
+    void materialVertex(inout MaterialVertexInputs material) {
+        vec2 localPos = getPosition().xy;
+        vec2 patchUv = materialParams.patchOffsetScale.xy + localPos * materialParams.patchOffsetScale.zw;
+        vec2 texUv = clamp(patchUv, vec2(0.0), vec2(1.0));
+
+        float terrainH = textureLod(materialParams_heightmap, texUv, 0.0).r;
+        float depth = textureLod(materialParams_waterDepthMap, texUv, 0.0).r;
+        float z = (terrainH + max(depth, 0.0)) * materialParams.heightScale;
+
+        vec2 localXy = (patchUv - 0.5) * materialParams.patchSize;
+        vec2 worldXy = rotateXy(localXy, materialParams.patchCosSin) + materialParams.patchCenter.xy;
+
+        material.worldPosition.xyz = vec3(worldXy, z + materialParams.patchCenter.z);
+        material.vUv = vec4(texUv, 0.0, 0.0);
+    }
+}
+
+fragment {
+    void material(inout MaterialInputs material) {
+        vec2 texUv = variable_vUv.xy;
+        float depth = textureLod(materialParams_waterDepthMap, texUv, 0.0).r;
+        if (depth <= 1e-4) {
+            discard;
+        }
+
+        prepareMaterial(material);
+
+        float falloff = materialParams.waterParams.x;
+        float opacity = materialParams.waterParams.y;
+        float roughness = materialParams.waterParams.z;
+
+        float factor = 1.0 - exp(-depth * falloff);
+        vec3 col = mix(materialParams.shallowColor.rgb, materialParams.deepColor.rgb, clamp(factor, 0.0, 1.0));
+
+        material.baseColor = vec4(col, clamp(opacity, 0.0, 1.0));
+        material.roughness = clamp(roughness, 0.04, 1.0);
+        material.metallic = 0.0;
+        material.reflectance = 0.65;
+    }
+}

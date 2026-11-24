@@ -19,6 +19,7 @@
 #include <QShowEvent>
 #include <QWheelEvent>
 #include <QtMath>
+#include <filament/Fence.h>
 #include <filament/Box.h>
 #include <filament/Camera.h>
 #include <filament/Color.h>
@@ -71,6 +72,10 @@ static const uint8_t MATERIAL_SKY_ATMOSPHERE_PKG[] = {
 
 static const uint8_t MATERIAL_GROUND_PLANE_PKG[] = {
 #include "materials/ground_plane_lit.h"
+};
+
+static const uint8_t MATERIAL_WATER_LIT_PKG[] = {
+#include "materials/water_lit.h"
 };
 
 constexpr size_t MAX_INSTANCES_PER_BATCH = 16384;
@@ -132,6 +137,25 @@ struct TerrainGpuEntry
   filament::Texture                       *normal_tex{nullptr};
   filament::Texture                       *albedo_tex{nullptr};
   bool                                     textures_dirty{true};
+  bool                                     visible{true};
+};
+
+struct WaterPatchNode
+{
+  utils::Entity               entity{};
+  filament::MaterialInstance *mat_instance{nullptr};
+  bool                        in_scene{false};
+};
+
+struct WaterGpuEntry
+{
+  scene::WaterLayerDescriptor              descriptor{};
+  std::unique_ptr<terrain::HeightmapPatch> patch{nullptr};
+  std::vector<terrain::CDLODInstance>      lod_instances{};
+  filament::Texture                       *heightmap_tex{nullptr};
+  filament::Texture                       *depth_tex{nullptr};
+  bool                                     textures_dirty{true};
+  bool                                     visible{true};
 };
 
 struct InstancedBatchGpu
@@ -150,6 +174,7 @@ struct InstancedGroupGpuEntry
   uint32_t                       index_count{0};
   std::vector<InstancedBatchGpu> batches{};
   bool                           gpu_dirty{true};
+  bool                           visible{true};
 };
 
 struct PathGpuEntry
@@ -163,6 +188,7 @@ struct PathGpuEntry
   utils::Entity               entity{};
   bool                        in_scene{false};
   bool                        gpu_dirty{true};
+  bool                        visible{true};
 };
 
 enum class PathDragMode : uint8_t
@@ -207,6 +233,7 @@ struct ViewportWidget::Impl
   filament::Material *terrain_unlit_mat{nullptr};
   filament::Material *terrain_lit_mat{nullptr};
   filament::Material *instanced_obj_mat{nullptr};
+  filament::Material *water_mat{nullptr};
 
   // Shared static grid mesh for CDLOD
   filament::VertexBuffer *shared_grid_vb{nullptr};
@@ -223,6 +250,10 @@ struct ViewportWidget::Impl
   std::map<std::string, TerrainGpuEntry> terrains{};
   std::vector<PatchRenderNode>           terrain_node_pool{};
   size_t                                 active_cdlod_nodes{0};
+
+  // Water layers state
+  std::map<std::string, WaterGpuEntry> waters{};
+  std::vector<WaterPatchNode>          water_node_pool{};
 
   // Instanced objects state
   std::map<std::string, InstancedGroupGpuEntry> instanced_groups{};
@@ -394,6 +425,56 @@ struct ViewportWidget::Impl
     active_cdlod_nodes = 0;
   }
 
+  void destroy_water_textures(WaterGpuEntry &entry)
+  {
+    if (!engine)
+    {
+      return;
+    }
+
+    if (entry.heightmap_tex)
+    {
+      engine->destroy(entry.heightmap_tex);
+      entry.heightmap_tex = nullptr;
+    }
+
+    if (entry.depth_tex)
+    {
+      engine->destroy(entry.depth_tex);
+      entry.depth_tex = nullptr;
+    }
+  }
+
+  void clear_water_node_pool()
+  {
+    if (!engine)
+    {
+      return;
+    }
+
+    for (auto &node : water_node_pool)
+    {
+      if (node.in_scene && scene && node.entity)
+      {
+        scene->remove(node.entity);
+        node.in_scene = false;
+      }
+      if (node.entity)
+      {
+        engine->destroy(node.entity);
+        utils::EntityManager::get().destroy(node.entity);
+        node.entity = {};
+      }
+      if (node.mat_instance)
+      {
+        engine->destroy(node.mat_instance);
+        node.mat_instance = nullptr;
+      }
+    }
+
+    water_node_pool.clear();
+  }
+
   void destroy_all()
   {
     if (!engine)
@@ -402,10 +483,16 @@ struct ViewportWidget::Impl
     }
 
     clear_terrain_node_pool();
+    clear_water_node_pool();
 
     for (auto &[id, t_entry] : terrains)
     {
       destroy_terrain_textures(t_entry);
+    }
+
+    for (auto &[id, w_entry] : waters)
+    {
+      destroy_water_textures(w_entry);
     }
 
     for (auto &[id, g_entry] : instanced_groups)
@@ -1665,6 +1752,21 @@ void ViewportWidget::showEvent(QShowEvent *event)
       init_filament();
     }
   }
+
+  if (filament_initialized_ && render_timer_ && !render_timer_->isActive())
+  {
+    render_timer_->start(16);
+  }
+}
+
+void ViewportWidget::hideEvent(QHideEvent *event)
+{
+  QWidget::hideEvent(event);
+
+  if (render_timer_ && render_timer_->isActive())
+  {
+    render_timer_->stop();
+  }
 }
 
 void ViewportWidget::wheelEvent(QWheelEvent *event)
@@ -1802,6 +1904,11 @@ void ViewportWidget::init_filament()
                                 .package(MATERIAL_GROUND_PLANE_PKG,
                                          sizeof(MATERIAL_GROUND_PLANE_PKG))
                                 .build(*impl_->engine);
+
+  impl_->water_mat = filament::Material::Builder()
+                         .package(MATERIAL_WATER_LIT_PKG,
+                                  sizeof(MATERIAL_WATER_LIT_PKG))
+                         .build(*impl_->engine);
 
   // Create fallback 1x1 white texture
   impl_->fallback_white_tex = filament::Texture::Builder()
@@ -2344,7 +2451,7 @@ void ViewportWidget::update_camera()
   const float     aspect = static_cast<float>(std::max(1, width())) /
                        static_cast<float>(std::max(1, height()));
 
-  impl_->camera->setProjection(45.0,
+  impl_->camera->setProjection(camera_fov_deg_,
                                aspect,
                                5.0,
                                18000.0,
@@ -3290,6 +3397,423 @@ void ViewportWidget::update_terrain_renderables()
   }
 
   impl_->active_cdlod_nodes = pool_idx;
+}
+
+void ViewportWidget::set_terrain_visible(const std::string &id, bool visible)
+{
+  auto it = impl_->terrains.find(id);
+  if (it != impl_->terrains.end() && it->second.visible != visible)
+  {
+    it->second.visible = visible;
+    if (filament_initialized_)
+    {
+      update_terrain_renderables();
+    }
+  }
+}
+
+void ViewportWidget::set_albedo_enabled(bool enabled)
+{
+  if (albedo_enabled_ != enabled)
+  {
+    albedo_enabled_ = enabled;
+    if (filament_initialized_)
+    {
+      update_terrain_renderables();
+    }
+  }
+}
+
+void ViewportWidget::set_normal_map_enabled(bool enabled)
+{
+  if (normal_map_enabled_ != enabled)
+  {
+    normal_map_enabled_ = enabled;
+    if (filament_initialized_)
+    {
+      update_terrain_renderables();
+    }
+  }
+}
+
+void ViewportWidget::set_height_scale_multiplier(float multiplier)
+{
+  const float clamped = std::max(0.01f, multiplier);
+  if (std::abs(height_scale_multiplier_ - clamped) > 1e-5f)
+  {
+    height_scale_multiplier_ = clamped;
+    if (filament_initialized_)
+    {
+      update_terrain_renderables();
+      update_water_renderables();
+    }
+  }
+}
+
+float ViewportWidget::get_height_scale_multiplier() const noexcept
+{
+  return height_scale_multiplier_;
+}
+
+void ViewportWidget::add_or_update_water(
+    const scene::WaterLayerDescriptor &descriptor)
+{
+  auto &entry = impl_->waters[descriptor.id];
+  entry.descriptor = descriptor;
+  entry.textures_dirty = true;
+
+  if (filament_initialized_)
+  {
+    update_water_renderables();
+  }
+}
+
+void ViewportWidget::clear_waters()
+{
+  impl_->clear_water_node_pool();
+  for (auto &[id, entry] : impl_->waters)
+  {
+    impl_->destroy_water_textures(entry);
+  }
+  impl_->waters.clear();
+}
+
+void ViewportWidget::remove_water(const std::string &id)
+{
+  auto it = impl_->waters.find(id);
+  if (it != impl_->waters.end())
+  {
+    impl_->destroy_water_textures(it->second);
+    impl_->waters.erase(it);
+    if (filament_initialized_)
+    {
+      update_water_renderables();
+    }
+  }
+}
+
+void ViewportWidget::set_water_visible(const std::string &id, bool visible)
+{
+  auto it = impl_->waters.find(id);
+  if (it != impl_->waters.end() && it->second.visible != visible)
+  {
+    it->second.visible = visible;
+    if (filament_initialized_)
+    {
+      update_water_renderables();
+    }
+  }
+}
+
+const scene::WaterSettings &ViewportWidget::get_water_settings() const noexcept
+{
+  return water_settings_;
+}
+
+void ViewportWidget::set_water_settings(const scene::WaterSettings &settings)
+{
+  water_settings_ = settings;
+  if (filament_initialized_)
+  {
+    update_water_renderables();
+  }
+}
+
+void ViewportWidget::set_instanced_group_visible(const std::string &id,
+                                                 bool               visible)
+{
+  auto it = impl_->instanced_groups.find(id);
+  if (it != impl_->instanced_groups.end() && it->second.visible != visible)
+  {
+    it->second.visible = visible;
+    if (impl_->scene)
+    {
+      for (auto &batch : it->second.batches)
+      {
+        if (visible && !batch.in_scene && batch.entity)
+        {
+          impl_->scene->addEntity(batch.entity);
+          batch.in_scene = true;
+        }
+        else if (!visible && batch.in_scene && batch.entity)
+        {
+          impl_->scene->remove(batch.entity);
+          batch.in_scene = false;
+        }
+      }
+    }
+  }
+}
+
+void ViewportWidget::set_path_visible(const std::string &id, bool visible)
+{
+  auto it = impl_->paths.find(id);
+  if (it != impl_->paths.end() && it->second.visible != visible)
+  {
+    it->second.visible = visible;
+    if (impl_->scene && it->second.entity)
+    {
+      if (visible && !it->second.in_scene)
+      {
+        impl_->scene->addEntity(it->second.entity);
+        it->second.in_scene = true;
+      }
+      else if (!visible && it->second.in_scene)
+      {
+        impl_->scene->remove(it->second.entity);
+        it->second.in_scene = false;
+      }
+    }
+  }
+}
+
+void ViewportWidget::reset_camera()
+{
+  set_camera_orbit(QVector3D(0.0f, 0.0f, 0.0f), 900.0f, -45.0f, 32.0f);
+  set_fov_deg(45.0f);
+}
+
+void ViewportWidget::set_fov_deg(float fov_deg)
+{
+  camera_fov_deg_ = std::clamp(fov_deg, 10.0f, 120.0f);
+  if (filament_initialized_)
+  {
+    update_camera();
+  }
+}
+
+float ViewportWidget::get_fov_deg() const noexcept
+{
+  return camera_fov_deg_;
+}
+
+QImage ViewportWidget::grab_framebuffer()
+{
+  if (!filament_initialized_ || !impl_->engine || !impl_->renderer ||
+      !impl_->swap_chain || !impl_->view)
+  {
+    return QImage();
+  }
+
+  const uint32_t w = static_cast<uint32_t>(std::max(1, width()));
+  const uint32_t h = static_cast<uint32_t>(std::max(1, height()));
+
+  QImage img(static_cast<int>(w), static_cast<int>(h), QImage::Format_RGBA8888);
+  const size_t byte_count = static_cast<size_t>(w) * static_cast<size_t>(h) * 4;
+  auto        *buf = new uint8_t[byte_count];
+
+  bool done = false;
+  if (impl_->renderer->beginFrame(impl_->swap_chain))
+  {
+    impl_->renderer->render(impl_->view);
+
+    filament::backend::PixelBufferDescriptor pbd(
+        buf,
+        byte_count,
+        filament::backend::PixelBufferDescriptor::PixelDataFormat::RGBA,
+        filament::backend::PixelBufferDescriptor::PixelDataType::UBYTE,
+        [](void *buffer, size_t, void *user)
+        {
+          delete[] static_cast<uint8_t *>(buffer);
+          if (user)
+          {
+            *static_cast<bool *>(user) = true;
+          }
+        },
+        &done);
+
+    impl_->renderer->readPixels(0, 0, w, h, std::move(pbd));
+    impl_->renderer->endFrame();
+  }
+  else
+  {
+    delete[] buf;
+    return QImage();
+  }
+
+  filament::Fence *fence = impl_->engine->createFence();
+  if (fence)
+  {
+    fence->wait(filament::Fence::Mode::FLUSH);
+    impl_->engine->destroy(fence);
+  }
+
+  // Pump a frame if callback hasn't fired yet
+  if (!done)
+  {
+    return QImage();
+  }
+
+  return img;
+}
+
+void ViewportWidget::update_water_renderables()
+{
+  if (!filament_initialized_ || !impl_->engine || !impl_->water_mat ||
+      !impl_->shared_grid_vb)
+  {
+    return;
+  }
+
+  filament::TextureSampler linear_sampler(
+      filament::TextureSampler::MinFilter::LINEAR,
+      filament::TextureSampler::MagFilter::LINEAR,
+      filament::TextureSampler::WrapMode::CLAMP_TO_EDGE);
+
+  size_t pool_idx = 0;
+
+  for (auto &[id, entry] : impl_->waters)
+  {
+    if (!entry.visible || !entry.descriptor.terrain_heightmap ||
+        !entry.descriptor.water_depth_map)
+    {
+      continue;
+    }
+
+    if (entry.textures_dirty)
+    {
+      impl_->destroy_water_textures(entry);
+
+      const auto  &hdata = *entry.descriptor.terrain_heightmap;
+      const auto  &ddata = *entry.descriptor.water_depth_map;
+      const size_t w = hdata.get_width();
+      const size_t h = hdata.get_height();
+
+      if (w > 0 && h > 0 && ddata.get_width() == w && ddata.get_height() == h)
+      {
+        entry.heightmap_tex =
+            filament::Texture::Builder()
+                .width(static_cast<uint32_t>(w))
+                .height(static_cast<uint32_t>(h))
+                .levels(1)
+                .sampler(filament::Texture::Sampler::SAMPLER_2D)
+                .format(filament::Texture::InternalFormat::R32F)
+                .build(*impl_->engine);
+
+        const size_t nbytes = w * h * sizeof(float);
+        float       *h_copy = new float[w * h];
+        std::memcpy(h_copy, hdata.get_data().data(), nbytes);
+        entry.heightmap_tex->setImage(
+            *impl_->engine,
+            0,
+            filament::Texture::PixelBufferDescriptor(
+                h_copy,
+                nbytes,
+                filament::Texture::Format::R,
+                filament::Texture::Type::FLOAT,
+                [](void *buf, size_t, void *)
+                { delete[] static_cast<float *>(buf); }));
+
+        entry.depth_tex =
+            filament::Texture::Builder()
+                .width(static_cast<uint32_t>(w))
+                .height(static_cast<uint32_t>(h))
+                .levels(1)
+                .sampler(filament::Texture::Sampler::SAMPLER_2D)
+                .format(filament::Texture::InternalFormat::R32F)
+                .build(*impl_->engine);
+
+        float *d_copy = new float[w * h];
+        std::memcpy(d_copy, ddata.get_data().data(), nbytes);
+        entry.depth_tex->setImage(
+            *impl_->engine,
+            0,
+            filament::Texture::PixelBufferDescriptor(
+                d_copy,
+                nbytes,
+                filament::Texture::Format::R,
+                filament::Texture::Type::FLOAT,
+                [](void *buf, size_t, void *)
+                { delete[] static_cast<float *>(buf); }));
+      }
+
+      entry.textures_dirty = false;
+    }
+
+    if (!entry.heightmap_tex || !entry.depth_tex)
+    {
+      continue;
+    }
+
+    const float rad = qDegreesToRadians(entry.descriptor.rotation_deg);
+    const filament::math::float2 cos_sin(std::cos(rad), std::sin(rad));
+    const float h_scale = entry.descriptor.height_scale *
+                          height_scale_multiplier_;
+
+    // Single full-domain patch for water surface
+    if (pool_idx >= impl_->water_node_pool.size())
+    {
+      WaterPatchNode node;
+      node.entity = utils::EntityManager::get().create();
+      node.mat_instance = impl_->water_mat->createInstance();
+
+      filament::Box bounds(filament::math::float3(-5000.0f, -5000.0f, -1000.0f),
+                           filament::math::float3(5000.0f, 5000.0f, 5000.0f));
+
+      filament::RenderableManager::Builder(1)
+          .boundingBox(bounds)
+          .material(0, node.mat_instance)
+          .geometry(0,
+                    filament::RenderableManager::PrimitiveType::TRIANGLES,
+                    impl_->shared_grid_vb,
+                    impl_->shared_solid_ib,
+                    0,
+                    impl_->solid_index_count)
+          .castShadows(false)
+          .receiveShadows(true)
+          .culling(false)
+          .build(*impl_->engine, node.entity);
+
+      impl_->water_node_pool.push_back(node);
+    }
+
+    auto &node = impl_->water_node_pool[pool_idx++];
+    auto *mi = node.mat_instance;
+    mi->setParameter("heightmap", entry.heightmap_tex, linear_sampler);
+    mi->setParameter("waterDepthMap", entry.depth_tex, linear_sampler);
+    mi->setParameter("patchOffsetScale",
+                     filament::math::float4(0.0f, 0.0f, 1.0f, 1.0f));
+    mi->setParameter("patchCenter",
+                     filament::math::float3(entry.descriptor.center.x,
+                                            entry.descriptor.center.y,
+                                            entry.descriptor.center.z));
+    mi->setParameter("patchSize",
+                     filament::math::float2(entry.descriptor.lx,
+                                            entry.descriptor.ly));
+    mi->setParameter("patchCosSin", cos_sin);
+    mi->setParameter("heightScale", h_scale);
+    mi->setParameter("shallowColor",
+                     filament::math::float4(water_settings_.shallow_color.x,
+                                            water_settings_.shallow_color.y,
+                                            water_settings_.shallow_color.z,
+                                            1.0f));
+    mi->setParameter("deepColor",
+                     filament::math::float4(water_settings_.deep_color.x,
+                                            water_settings_.deep_color.y,
+                                            water_settings_.deep_color.z,
+                                            1.0f));
+    mi->setParameter("waterParams",
+                     filament::math::float4(water_settings_.depth_falloff,
+                                            water_settings_.opacity,
+                                            water_settings_.roughness,
+                                            0.0f));
+
+    if (!node.in_scene)
+    {
+      impl_->scene->addEntity(node.entity);
+      node.in_scene = true;
+    }
+  }
+
+  for (size_t i = pool_idx; i < impl_->water_node_pool.size(); ++i)
+  {
+    auto &node = impl_->water_node_pool[i];
+    if (node.in_scene)
+    {
+      impl_->scene->remove(node.entity);
+      node.in_scene = false;
+    }
+  }
 }
 
 } // namespace oros::ui

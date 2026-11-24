@@ -165,4 +165,27 @@ struct EnvironmentSettings
   float         ground_plane_roughness{0.88f};
 };
 
+// --- Water layer & settings
+
+struct WaterLayerDescriptor
+{
+  std::string                             id{};
+  std::shared_ptr<terrain::HeightmapData> terrain_heightmap{};
+  std::shared_ptr<terrain::HeightmapData> water_depth_map{};
+  terrain::Vec3                           center{0.0f, 0.0f, 0.0f};
+  float                                   lx{1000.0f};
+  float                                   ly{1000.0f};
+  float                                   rotation_deg{0.0f};
+  float                                   height_scale{150.0f};
+};
+
+struct WaterSettings
+{
+  terrain::Vec3 shallow_color{0.18f, 0.58f, 0.62f};
+  terrain::Vec3 deep_color{0.03f, 0.16f, 0.28f};
+  float         depth_falloff{6.0f};
+  float         opacity{0.82f};
+  float         roughness{0.12f};
+};
+
 } // namespace oros::scene
